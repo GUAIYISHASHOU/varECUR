@@ -1,0 +1,39 @@
+# Training configuration for IMU route model (EuRoC step labels)
+train:
+  route: gyr  # 改为陀螺仪
+  x_mode: both  # 使用IMU+视觉双模态输入
+  train_npz: "F:/SLAMdata/_cache/euroc_split_eachseq/train_all.npz"
+  val_npz: "F:/SLAMdata/_cache/euroc_split_eachseq/val_all.npz"
+  test_npz: "F:/SLAMdata/_cache/euroc_split_eachseq/test_all.npz"
+  epochs: 50  # 步级标签收敛更快，避免过训练
+  batch_size: 32
+  lr: 1e-3
+  early_patience: 8
+  # Learning rate scheduler settings
+  lr_sched: cosine
+  warmup_epochs: 3
+  min_lr: 1e-5
+  plateau_patience: 3
+  plateau_factor: 0.5
+  # Other training settings
+  seed: 0
+  logv_min: -12.0
+  logv_max: 6.0
+  z2_center: 0.0
+  z2_center_target: "auto"
+  anchor_weight: 0.0
+  run_dir: "runs/gyr_euroc_step"  # 陀螺仪模型的运行目录
+
+# Model configuration
+model:
+  d_model: 128
+  n_tcn: 4
+  kernel_size: 3
+  n_heads: 4
+  n_layers_tf: 2
+  dropout: 0.1
+
+# Runtime configuration
+runtime:
+  num_workers: 0
+  device: "cuda"  # or "cpu"
