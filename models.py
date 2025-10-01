@@ -32,14 +32,19 @@ class TCNBlock(nn.Module):
 # ----- Model: (B,T,D_in) -> (B,T,D_out logvar) -----
 class IMURouteModel(nn.Module):
     def __init__(self, d_in: int, d_model: int=128, d_out: int=1, n_tcn: int=4, kernel_size:int=3,
-                 dilations=(1,2,4,8), n_layers_tf: int=2, n_heads:int=4, dropout: float=0.1):
+                 dilations=(1,2,4,8), n_layers_tf: int=2, n_heads:int=4, dropout: float=0.1, route: str="acc"):
         super().__init__()
         self.d_out = d_out
+        self.route = route
         self.inp = nn.Linear(d_in, d_model)
         self.tcn = nn.Sequential(*[TCNBlock(d_model, kernel_size=kernel_size, dilation=dilations[i%len(dilations)], dropout=dropout) for i in range(n_tcn)])
         enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=d_model*4, dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
         self.tf = nn.TransformerEncoder(enc_layer, num_layers=n_layers_tf)
         self.head = nn.Linear(d_model, d_out)
+        
+        # >>> VIS-CALIB: learnable global log-variance bias for VIS
+        if route == "vis":
+            self.logv_bias = nn.Parameter(torch.zeros(1))  # scalar temperature initialized at zero
 
     def forward(self, x):  # x: (B,T,D_in)
         h = self.inp(x)           # (B,T,C)
@@ -48,4 +53,12 @@ class IMURouteModel(nn.Module):
         h = h.transpose(1,2)      # (B,T,C)
         h = self.tf(h)            # (B,T,C)
         logv = self.head(h)       # (B,T,D_out)
+        
+        # VIS分支：应用内置温度参�?
+        if self.route == "vis" and hasattr(self, 'logv_bias'):
+            logv = logv + self.logv_bias  # 训练期、验证期统一使用
+        
         return logv
+
+
+

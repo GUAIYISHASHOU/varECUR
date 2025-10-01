@@ -1,0 +1,19 @@
+# 列出 6 条 EuRoC 序列（以 cam0 为例），循环运行以下命令
+python tools/gen_vis_npz_euroc.py --euroc_root "F:/SLAMdata/V1_01_easy" --cam_id 0 --out "F:/SLAMdata/_cache/vis_eachseq"
+python tools/gen_vis_npz_euroc.py --euroc_root "F:/SLAMdata/V1_02_medium" --cam_id 0 --out "F:/SLAMdata/_cache/vis_eachseq"
+python tools/gen_vis_npz_euroc.py --euroc_root "F:/SLAMdata/V1_03_difficult" --cam_id 0 --out "F:/SLAMdata/_cache/vis_eachseq"
+python tools/gen_vis_npz_euroc.py --euroc_root "F:/SLAMdata/V2_01_easy" --cam_id 0 --out "F:/SLAMdata/_cache/vis_eachseq"
+python tools/gen_vis_npz_euroc.py --euroc_root "F:/SLAMdata/V2_02_medium" --cam_id 0 --out "F:/SLAMdata/_cache/vis_eachseq"
+python tools/gen_vis_npz_euroc.py --euroc_root "F:/SLAMdata/V2_03_difficult" --cam_id 0 --out "F:/SLAMdata/_cache/vis_eachseq"
+
+
+python tools/split_eachseq_merge_npz.py `
+  --root "F:/SLAMdata/_cache/vis_eachseq" `
+  --pattern "*_cam0_vis.npz" `
+  --split 0.7 0.15 0.15 `
+  --mode chronological `
+  --out_dir "F:/SLAMdata/_cache/vis_split" `
+  --keys X_VIS E2_VIS MASK_VIS TS_VIS
+
+
+

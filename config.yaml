@@ -1,28 +1,50 @@
-# Training configuration for IMU route model (EuRoC step labels)
+﻿# Training configuration for VIS route model (EuRoC visual NPZ)
 train:
-  route: gyr  # 改为陀螺仪
-  x_mode: both  # 使用IMU+视觉双模态输入
-  train_npz: "F:/SLAMdata/_cache/euroc_split_eachseq/train_all.npz"
-  val_npz: "F:/SLAMdata/_cache/euroc_split_eachseq/val_all.npz"
-  test_npz: "F:/SLAMdata/_cache/euroc_split_eachseq/test_all.npz"
-  epochs: 50  # 步级标签收敛更快，避免过训练
-  batch_size: 32
+  route: vis             # visual route
+  x_mode: visual         # only use visual features
+  train_npz: "F:/SLAMdata/_cache/vis_split_new/train_all.npz"
+  val_npz:   "F:/SLAMdata/_cache/vis_split_new/val_all.npz"
+  test_npz:  "F:/SLAMdata/_cache/vis_split_new/test_all.npz"
+  epochs: 80              # vision supervision is weak, train longer
+  batch_size: 64
   lr: 1e-3
-  early_patience: 8
+  early_patience: 10
+
+  # Loss function settings (vision)
+  vis_loss: gauss_huber   # can be iso or gauss_huber
+  vis_huber_delta: 1.2    # lower delta to be more robust
+  vis_center_weight: 5e-2 # center regularization to keep variance reasonable
+  vis_center_weight_start: 1.0e-1
+  vis_center_weight_end:   2.0e-2
+  vis_ema_aux_alpha: 0.05
+  vis_ema_tau: 5
+  
+  # === 2D Diagonal Covariance Mode ===
+  # Set to true to use per-axis (x,y) diagonal supervision instead of 1D aggregated error
+  # Requires NPZ files with E2X_VIS, E2Y_VIS fields (from updated gen_vis_npz_euroc.py)
+  # Falls back to E2/2 approximation if diagonal fields are missing
+  vis_2d_diag: true       # Enable 2D diagonal covariance (x,y axes)
+  vis_axis_balance: ema   # Axis balance mode: 'ema' or 'none'
+  vis_axis_beta: 0.9      # EMA beta for axis balancing (0.9 = slow adaptation)
+  vis_axis_gamma: 1.0     # Power for inverse-proportional weighting
+  vis_huber_delta_x: 1.2  # Huber delta for x-axis (can differ from y)
+  vis_huber_delta_y: 1.2  # Huber delta for y-axis
+
   # Learning rate scheduler settings
   lr_sched: cosine
   warmup_epochs: 3
   min_lr: 1e-5
   plateau_patience: 3
   plateau_factor: 0.5
+
   # Other training settings
   seed: 0
   logv_min: -12.0
   logv_max: 6.0
   z2_center: 0.0
   z2_center_target: "auto"
-  anchor_weight: 0.0
-  run_dir: "runs/gyr_euroc_step"  # 陀螺仪模型的运行目录
+  post_scale: true        # after training, do temperature scaling on val
+  run_dir: "runs/vis_2d_diag_68feat"  # output directory (68-dim features + 2D diagonal)
 
 # Model configuration
 model:

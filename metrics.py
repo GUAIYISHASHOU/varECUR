@@ -3,16 +3,35 @@ import math
 import torch
 import numpy as np
 
+# 统一的自由度定义
+DF_BY_ROUTE = {"vis": 2, "acc": 3, "gyr": 3}
+
+def z2_from_residual(residual, logvar, df):
+    """统一的z²计算函数
+    Args:
+        residual: 残差张量，最后一维是空间维度 
+        logvar: 对数方差，如果VIS是各向同性则为1维
+        df: 自由度
+    """
+    sigma2 = torch.exp(logvar)
+    e2 = (residual**2).sum(dim=-1) / sigma2        # 2D: (rx^2+ry^2)/σ^2
+    return e2 / df                                  # 统一这里除以 df
+
 
 def _prepare_inputs(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor):
-    if logv.dim() == 3 and logv.size(-1) == 1:
+    # Handle 2D diagonal mode (VIS with per-axis variance)
+    if logv.dim() == 3 and logv.size(-1) == 2:
+        # 2D diagonal: average the two axes for metrics computation
+        logv = logv.mean(dim=-1)  # (B,T,2) -> (B,T)
+    elif logv.dim() == 3 and logv.size(-1) == 1:
         logv = logv.squeeze(-1)
+    
     if e2sum.dim() == 3 and e2sum.size(-1) == 1:
         e2sum = e2sum.squeeze(-1)
     if mask.dim() == 3 and mask.size(-1) == 1:
         mask = mask.squeeze(-1)
     if logv.dim() != 2 or e2sum.dim() != 2 or mask.dim() != 2:
-        raise ValueError("Expected (B,T) tensors after squeeze")
+        raise ValueError(f"Expected (B,T) tensors after squeeze, got logv:{logv.shape}, e2sum:{e2sum.shape}, mask:{mask.shape}")
     return e2sum, logv, mask
 
 
@@ -20,7 +39,25 @@ def _prepare_inputs(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor)
 def _route_metrics(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
                   logv_min: float, logv_max: float, df: float,
                   yvar: torch.Tensor | None = None) -> dict:
+    # Handle 2D diagonal mode (VIS with per-axis variance)
+    if logv.dim() == 3 and logv.size(-1) == 2:
+        # 2D diagonal: average the two axes for metrics computation
+        logv = logv.mean(dim=-1)  # (B,T,2) -> (B,T)
+    elif logv.dim() == 3 and logv.size(-1) == 1:
+        logv = logv.squeeze(-1)
+    
+    # squeeze (B,T,1) -> (B,T)
+    if e2sum.dim()==3 and e2sum.size(-1)==1: 
+        e2sum = e2sum.squeeze(-1)
+    if mask.dim()==3  and mask.size(-1)==1:  
+        mask  = mask.squeeze(-1)
+
+    # (B,1) -> (B,T) 以 e2sum 的时间维为准
+    if e2sum.dim()==2 and mask.dim()==2 and mask.size(1)==1 and e2sum.size(1)>1:
+        mask = mask.expand(-1, e2sum.size(1))
+    
     e2sum, logv, mask = _prepare_inputs(e2sum, logv, mask)
+    
     logv = torch.clamp(logv, min=logv_min, max=logv_max)
     var = torch.clamp(torch.exp(logv), min=1e-12)
     m = mask.float()
@@ -28,7 +65,7 @@ def _route_metrics(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
     # NaN-safe for e2sum and mask-out invalids
     e2sum = torch.nan_to_num(e2sum, nan=0.0, posinf=0.0, neginf=0.0)
     e2sum = torch.where(m > 0.5, e2sum, torch.zeros_like(e2sum))
-    z2 = (e2sum / var) / float(df)
+    z2 = e2sum / (var * float(df))
     z2 = torch.clamp(z2, min=0.0)
     msum = torch.clamp(m.sum(), min=1.0)
     z2_mean = float((z2 * m).sum() / msum)
@@ -115,6 +152,7 @@ def route_metrics_imu(e2: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
       1) ISO-1: (B,T) 或 (B,T,1)
       2) DIAG-3: (B,T,3) —— 自动折叠为 ISO-1 再计算指标（df=3）
     """
+    df = DF_BY_ROUTE["acc"]  # IMU默认使用acc的自由度
     if (e2.dim() == 3 and e2.size(-1) == 3) or (logv.dim() == 3 and logv.size(-1) == 3):
         # 折叠到 (B,T)
         if e2.dim() == 3 and e2.size(-1) == 3 and logv.dim() == 3 and logv.size(-1) == 3:
@@ -128,18 +166,19 @@ def route_metrics_imu(e2: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
             e2sum = e2.squeeze(-1) if e2.dim() == 3 and e2.size(-1) == 1 else e2
             logv_iso = torch.logsumexp(logv, dim=-1) - math.log(float(logv.size(-1)))
         e2sum, logv_iso, mask2 = _prepare_inputs(e2sum, logv_iso, mask)
-        return _route_metrics(e2sum, logv_iso, mask2, logv_min, logv_max, df=3.0, yvar=yvar)
+        return _route_metrics(e2sum, logv_iso, mask2, logv_min, logv_max, df=df, yvar=yvar)
     else:
         # 原 ISO 路径
         e2sum, logv1, mask1 = _prepare_inputs(e2, logv, mask)
-        return _route_metrics(e2sum, logv1, mask1, logv_min, logv_max, df=3.0, yvar=yvar)
+        return _route_metrics(e2sum, logv1, mask1, logv_min, logv_max, df=df, yvar=yvar)
 
 
 @torch.no_grad()
 def route_metrics_vis(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
                      logv_min: float, logv_max: float,
                      yvar: torch.Tensor | None = None) -> dict:
-    return _route_metrics(e2sum, logv, mask, logv_min, logv_max, df=2.0, yvar=yvar)
+    df = DF_BY_ROUTE["vis"]
+    return _route_metrics(e2sum, logv, mask, logv_min, logv_max, df=df, yvar=yvar)
 
 # ======= New tools and improved GNSS metrics =======
 from typing import Dict, Tuple, List

@@ -1,9 +1,15 @@
-# 环境（Python 3.10+，PyTorch ≥ 2.x）
-pip install torch torchvision torchaudio  # 选择与你 CUDA 匹配的命令
-pip install numpy matplotlib
+# 环境要求
+Python 3.10+`PyTorch ≥ 2.x
+```bash
+pip install torch torchvision torchaudio  # 选择与CUDA匹配的版本
+pip install numpy matplotlib pyyaml
+```
 
-# 1) 从 EuRoC 生成步级标签 NPZ
-# 单序列示例（输出到 _cache\euroc_step_v2）
+# 快速开始
+
+## 1) 从 EuRoC 生成步级标签 NPZ
+```bash
+# 单序列示例
 python tools/gen_euroc_step_npz.py `
   --euroc_root F:\SLAMdata `
   --seqs V2_03_difficult `
@@ -13,7 +19,7 @@ python tools/gen_euroc_step_npz.py `
   --gyr_smooth 7 --gyr_mask_edge 3 `
   --est_tau 2 --w_logmap
 
-# 批量六序列
+# 批量生成六个序列
 python tools/gen_euroc_step_npz.py `
   --euroc_root F:\SLAMdata `
   --seqs "V1_01_easy,V1_02_medium,V1_03_difficult,V2_01_easy,V2_02_medium,V2_03_difficult" `
@@ -22,43 +28,97 @@ python tools/gen_euroc_step_npz.py `
   --acc_smooth 7 --mask_edge 3 `
   --gyr_smooth 7 --gyr_mask_edge 3 `
   --est_tau 2 --w_logmap
+```
 
-# 2) NPZ 质量体检（含出图）
+## 2) NPZ 数据质量检查
+```bash
+# 详细体检（包含图像输出）
 python tools/npz_sanity_check.py --glob "F:\SLAMdata\_cache\euroc_step_v2\*.npz" --plots
-# 轻量体检
-python tools/check_npz.py --root "F:\SLAMdata\_cache\euroc_step_v2"
 
-# 3) 每序列切分并合并（防泄露：按时间切块）
+# 快速检查
+python tools/check_npz.py --root "F:\SLAMdata\_cache\euroc_step_v2"
+```
+
+## 3) 数据集切分与合并
+```bash
+# 按时间顺序切分`防止数据泄露
 python tools/split_eachseq_merge_npz.py `
   --root F:\SLAMdata\_cache\euroc_step_v2 `
   --out_dir F:\SLAMdata\_cache\euroc_split_eachseq `
   --pattern "*.npz" --split 0.70 0.15 0.15 --mode chronological
+```
 
-# 4) 训练（acc / gyr）
-# 4.1 一维高斯（默认）
-python train.py --config config.yaml --route acc `
-  --train_npz "F:/SLAMdata/_cache/euroc_split_eachseq/train_all.npz" `
-  --val_npz   "F:/SLAMdata/_cache/euroc_split_eachseq/val_all.npz" `
-  --test_npz  "F:/SLAMdata/_cache/euroc_split_eachseq/test_all.npz"
+# 训练模型
 
-# 4.2 三轴 Student‑t 对角 NLL（步级标签）
-python train.py --config config.yaml --route gyr `
-  --train_npz "F:/SLAMdata/_cache/euroc_split_eachseq/train_all.npz" `
-  --val_npz   "F:/SLAMdata/_cache/euroc_split_eachseq/val_all.npz" `
-  --test_npz  "F:/SLAMdata/_cache/euroc_split_eachseq/test_all.npz" `
-  --imu_loss studentt_diag --student_nu 6.0
+## 4.1) Gaussian+Huber 损失（推荐）
+```bash
+# 使用配置文件训练
+python train.py --config config.yaml
 
-# 5) 评测与按序列出图
-# 总体评测（示例 gyr）
-python eval.py --route gyr --npz "F:/SLAMdata/_cache/euroc_split_eachseq/test_all.npz" --model runs/gyr_euroc_step/best.pt
+# 或者手动指定参数
+python train.py --config config.yaml `
+  --route gyr `
+  --imu_loss gauss_huber `
+  --huber_delta 1.5 `
+  --cal_reg 0.05 `
+  --run_dir runs/gyr_euroc_step_huber
+```
 
-# 按序列图（需要 split 的 manifest.json）
-python eval.py --route acc `
+## 4.2) 传统高斯损失
+```bash
+python train.py --config config.yaml `
+  --route acc `
+  --imu_loss iso `
+  --run_dir runs/acc_euroc_step_iso
+```
+
+## 4.3) Student-t 对角损失（异常值稳健）
+```bash
+python train.py --config config.yaml `
+  --route gyr `
+  --imu_loss studentt_diag `
+  --student_nu 6.0 `
+  --run_dir runs/gyr_euroc_step_studentt
+```
+
+# 模型评估
+
+## 5.1) 基础评估
+```bash
+python eval.py --route gyr `
   --npz "F:/SLAMdata/_cache/euroc_split_eachseq/test_all.npz" `
-  --model runs/acc_euroc_step/best.pt `
-  --manifest "F:/SLAMdata/_cache/euroc_split_eachseq/manifest.json" `
-  --plots_dir runs/acc_euroc_step/perseq_plots
+  --model runs/gyr_euroc_step_huber/best.pt
+```
 
-# 备注
-# - 生成阶段可加 --use_gt_bias，但训练/评测需保持一致口径。
-# - 可用 train.yaml 的 z2_center 做轻度居中；GNSS 路由支持 post_scale 与 t 口径评测。
+## 5.2) 带全局温度校正的评估
+```bash
+python eval.py --route gyr `
+  --npz "F:/SLAMdata/_cache/euroc_split_eachseq/test_all.npz" `
+  --model runs/gyr_euroc_step_huber/best.pt `
+  --auto_temp global
+```
+
+## 5.3) 按序列分析与绘图
+```bash
+python eval.py --route gyr `
+  --npz "F:/SLAMdata/_cache/euroc_split_eachseq/test_all.npz" `
+  --model runs/gyr_euroc_step_huber/best.pt `
+  --manifest "F:/SLAMdata/_cache/euroc_split_eachseq/manifest.json" `
+  --plots_dir runs/gyr_euroc_step_huber/perseq_plots `
+  --auto_temp global
+```
+
+# 损失函数对比
+
+| 损失函数 | 特点 | 适用场景 |
+|---------|------|----------|
+| `iso` | 传统高斯NLL | 基线对比 |
+| `gauss_huber` | Gaussian+Huber`稳健性强 | **推荐使用** |
+| `studentt_diag` | Student-t对角`异常值稳健 | 数据噪声较大时 |
+
+# 重要说明
+
+⚠️ **配置文件语法**：使用 `--config config.yaml` 或 `@config.yaml`
+⚠️ **数据一致性**：生成`训练`评测需保持相同的预处理参数
+⚠️ **温度校正**：Huber损失配合全局温度校正效果最佳
+⚠️ **路径格式**：Windows下使用正斜杠 `/` 或转义反斜杠 `\\`
