@@ -3,14 +3,14 @@ import math
 import torch
 import numpy as np
 
-# 统一的自由度定义
-DF_BY_ROUTE = {"vis": 2, "acc": 3, "gyr": 3}
+# 统一的自由度定义 (VIS removed)
+DF_BY_ROUTE = {"acc": 3, "gyr": 3}
 
 def z2_from_residual(residual, logvar, df):
     """统一的z²计算函数
     Args:
         residual: 残差张量，最后一维是空间维度 
-        logvar: 对数方差，如果VIS是各向同性则为1维
+        logvar: 对数方差
         df: 自由度
     """
     sigma2 = torch.exp(logvar)
@@ -19,11 +19,8 @@ def z2_from_residual(residual, logvar, df):
 
 
 def _prepare_inputs(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor):
-    # Handle 2D diagonal mode (VIS with per-axis variance)
-    if logv.dim() == 3 and logv.size(-1) == 2:
-        # 2D diagonal: average the two axes for metrics computation
-        logv = logv.mean(dim=-1)  # (B,T,2) -> (B,T)
-    elif logv.dim() == 3 and logv.size(-1) == 1:
+    # VIS 2D diagonal mode removed
+    if logv.dim() == 3 and logv.size(-1) == 1:
         logv = logv.squeeze(-1)
     
     if e2sum.dim() == 3 and e2sum.size(-1) == 1:
@@ -39,11 +36,8 @@ def _prepare_inputs(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor)
 def _route_metrics(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
                   logv_min: float, logv_max: float, df: float,
                   yvar: torch.Tensor | None = None) -> dict:
-    # Handle 2D diagonal mode (VIS with per-axis variance)
-    if logv.dim() == 3 and logv.size(-1) == 2:
-        # 2D diagonal: average the two axes for metrics computation
-        logv = logv.mean(dim=-1)  # (B,T,2) -> (B,T)
-    elif logv.dim() == 3 and logv.size(-1) == 1:
+    # VIS 2D diagonal mode removed
+    if logv.dim() == 3 and logv.size(-1) == 1:
         logv = logv.squeeze(-1)
     
     # squeeze (B,T,1) -> (B,T)
@@ -173,152 +167,3 @@ def route_metrics_imu(e2: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
         return _route_metrics(e2sum, logv1, mask1, logv_min, logv_max, df=df, yvar=yvar)
 
 
-@torch.no_grad()
-def route_metrics_vis(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
-                     logv_min: float, logv_max: float,
-                     yvar: torch.Tensor | None = None) -> dict:
-    df = DF_BY_ROUTE["vis"]
-    return _route_metrics(e2sum, logv, mask, logv_min, logv_max, df=df, yvar=yvar)
-
-# ======= New tools and improved GNSS metrics =======
-from typing import Dict, Tuple, List
-
-def _spearman_no_scipy(x: np.ndarray, y: np.ndarray) -> float:
-    if x.size < 3 or y.size < 3:
-        return 0.0
-    rx = np.argsort(np.argsort(x))
-    ry = np.argsort(np.argsort(y))
-    c = np.corrcoef(rx, ry)
-    return float(c[0, 1])
-
-def _student_t_z2_thresholds(nu: float, coverages=(0.68, 0.95)) -> Dict[str, float]:
-    """
-    双侧覆盖率阈值：给定 Student-t(ν)，返回 z^2=e^2/var 的阈值（不取 sqrt）。
-    例如 p=0.95 -> |t|<=t_{(1+p)/2}，z2_thresh = t^2
-    """
-    try:
-        from scipy.stats import t as scipy_t
-        out = {}
-        for p in coverages:
-            q = scipy_t.ppf((1.0 + p) / 2.0, df=nu)  # 正分位
-            out[f"{int(round(p*100))}"] = q * q
-        return out
-    except ImportError:
-        # 如果没有scipy，使用近似值
-        import math
-        out = {}
-        for p in coverages:
-            # 简单近似：对于常见的nu值使用预计算的值
-            if abs(nu - 3.0) < 0.1:
-                if abs(p - 0.68) < 0.01:
-                    q_squared = 1.32  # t_3(0.84)^2 ≈ 1.32
-                elif abs(p - 0.95) < 0.01:
-                    q_squared = 9.22  # t_3(0.975)^2 ≈ 9.22
-                else:
-                    q_squared = 1.0  # fallback
-            else:
-                # 其他nu值的粗略近似
-                if abs(p - 0.68) < 0.01:
-                    q_squared = 1.0 + 0.5 / nu
-                elif abs(p - 0.95) < 0.01:
-                    q_squared = 4.0 + 2.0 / nu
-                else:
-                    q_squared = 1.0
-            out[f"{int(round(p*100))}"] = q_squared
-        return out
-
-def _reliability_by_var(e2: np.ndarray, v: np.ndarray, m: np.ndarray, nbuckets: int = 10) -> dict:
-    mask = (m.reshape(-1) > 0.5)
-    if mask.sum() == 0:
-        return {"bucket_edges": [], "bucket_ez2": [], "bucket_var": [], "bucket_err2": [],
-                "slope": 0.0, "spearman": 0.0}
-    e2 = e2.reshape(-1)[mask]
-    v  = v.reshape(-1)[mask]
-    v  = np.clip(v, 1e-12, None)
-
-    # 分位桶
-    edges = np.quantile(v, np.linspace(0.0, 1.0, nbuckets + 1))
-    idx = np.digitize(v, edges[1:-1], right=True)
-    bucket_ez2, bucket_var, bucket_err2 = [], [], []
-    for b in range(nbuckets):
-        sel = (idx == b)
-        if sel.sum() == 0:
-            bucket_ez2.append(float("nan"))
-            bucket_var.append(float("nan"))
-            bucket_err2.append(float("nan"))
-        else:
-            bucket_ez2.append(float(np.mean(e2[sel] / v[sel])))
-            bucket_var.append(float(np.mean(v[sel])))
-            bucket_err2.append(float(np.mean(e2[sel])))
-
-    # 相关性与斜率：log(err²) ~ a*log(var)+b
-    X = np.log(v)
-    Y = np.log(np.clip(e2, 1e-18, None))
-    A = np.vstack([X, np.ones_like(X)]).T
-    a, b = np.linalg.lstsq(A, Y, rcond=None)[0]  # slope, intercept
-    spearman = _spearman_no_scipy(X, Y)
-
-    return {
-        "bucket_edges": [float(e) for e in edges],
-        "bucket_ez2": bucket_ez2,
-        "bucket_var": bucket_var,
-        "bucket_err2": bucket_err2,
-        "slope": float(a),
-        "spearman": float(spearman),
-    }
-
-@torch.no_grad()
-def route_metrics_gns_axes(e2_axes: torch.Tensor, logv_axes: torch.Tensor, mask_axes: torch.Tensor,
-                           logv_min: float, logv_max: float, nu: float = 0.0) -> dict:
-    """
-    GNSS 各向异性评测（逐轴）：统一 t 口径 + 高斯口径对照，并输出可靠性曲线。
-    - e2_axes: (B,T,3) 逐轴误差平方（ENU）
-    - logv_axes: (B,T,3) 逐轴 log(var)
-    - mask_axes: (B,T,3)
-    """
-    lv = torch.clamp(logv_axes, min=logv_min, max=logv_max)
-    v  = torch.clamp(torch.exp(lv), min=1e-12)
-    m  = mask_axes.float()
-    z2 = (e2_axes / v)  # 1D z²
-    den = m.sum(dim=(0,1)).clamp_min(1.0)  # (3,)
-
-    # —— t 口径（若 nu>2）——
-    out = {}
-    if nu and nu > 2.0:
-        target = float(nu / (nu - 2.0))  # E[t^2]
-        thr_t = _student_t_z2_thresholds(nu, coverages=(0.68, 0.95))
-        z2_mean_raw = (z2 * m).sum(dim=(0,1)) / den                       # (3,)
-        z2_mean_norm = z2_mean_raw / target                                # (3,)
-        cov68_t = ((z2 <= thr_t["68"]).float() * m).sum(dim=(0,1)) / den
-        cov95_t = ((z2 <= thr_t["95"]).float() * m).sum(dim=(0,1)) / den
-        out.update({
-            "t_nu": nu,
-            "t_target": target,
-            "z2_mean_raw": z2_mean_raw.detach().cpu().tolist(),
-            "z2_mean_norm": z2_mean_norm.detach().cpu().tolist(),
-            "cov68_t": cov68_t.detach().cpu().tolist(),
-            "cov95_t": cov95_t.detach().cpu().tolist(),
-            "t_z2_thr68": thr_t["68"],
-            "t_z2_thr95": thr_t["95"],
-        })
-    else:
-        target = 1.0  # 回落到高斯口径
-
-    # —— 高斯口径对照（χ² df=1）——
-    cov68_g = ((z2 <= 1.0).float() * m).sum(dim=(0,1)) / den
-    cov95_g = ((z2 <= 3.841).float() * m).sum(dim=(0,1)) / den
-    z2_mean = (z2 * m).sum(dim=(0,1)) / den
-    out.update({
-        "z2_mean_gauss": z2_mean.detach().cpu().tolist(),
-        "cov68_g": cov68_g.detach().cpu().tolist(),
-        "cov95_g": cov95_g.detach().cpu().tolist(),
-    })
-
-    # —— 可靠性曲线（分桶） —— 
-    e2_np = e2_axes.detach().cpu().numpy()
-    v_np  = v.detach().cpu().numpy()
-    m_np  = m.detach().cpu().numpy()
-    rel = [_reliability_by_var(e2_np[...,i], v_np[...,i], m_np[...,i], nbuckets=10) for i in range(e2_np.shape[-1])]
-    out["reliability"] = rel  # list of dicts per axis
-
-    return out

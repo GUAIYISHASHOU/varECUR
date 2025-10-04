@@ -1,12 +1,16 @@
 data_cache/
 .idea/
 runs/
-data_vis/
 __pycache__/
 trajectory_plots/
 data_gns/
 plots_gns/
+data_vis/
 project_old.txt
 改进建议.txt
 STEP_LABELS_GUIDE.md
 project.txt
+*.pyc
+*.pyo
+*.pt
+*.npz

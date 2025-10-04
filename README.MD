@@ -1,5 +1,5 @@
 # 环境要求
-Python 3.10+`PyTorch ≥ 2.x
+Python 3.10+ · PyTorch ≥ 2.x
 ```bash
 pip install torch torchvision torchaudio  # 选择与CUDA匹配的版本
 pip install numpy matplotlib pyyaml
@@ -32,10 +32,7 @@ python tools/gen_euroc_step_npz.py `
 
 ## 2) NPZ 数据质量检查
 ```bash
-# 详细体检（包含图像输出）
-python tools/npz_sanity_check.py --glob "F:\SLAMdata\_cache\euroc_step_v2\*.npz" --plots
-
-# 快速检查
+# 快速检查（推荐）
 python tools/check_npz.py --root "F:\SLAMdata\_cache\euroc_step_v2"
 ```
 

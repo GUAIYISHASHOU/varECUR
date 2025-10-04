@@ -5,12 +5,12 @@ import torch
 from utils import to_device, load_config_file
 import dataset  # 避免同名遮蔽
 from models import IMURouteModel
-from metrics import route_metrics_imu, route_metrics_vis, route_metrics_gns_axes, DF_BY_ROUTE
+from metrics import route_metrics_imu, DF_BY_ROUTE
 
 def parse_args():
     # 先解析 --route 参数来确定配置段
     pre_route = argparse.ArgumentParser(add_help=False)
-    pre_route.add_argument("--route", choices=["acc","gyr","vis","gns"], default=None)
+    pre_route.add_argument("--route", choices=["acc","gyr"], default=None)
     args_route, _ = pre_route.parse_known_args()
     
     pre = argparse.ArgumentParser(add_help=False)
@@ -19,25 +19,19 @@ def parse_args():
 
     cfg = load_config_file(args_pre.config)
     
-    # 根据 --route 参数读取对应的配置段
+    # IMU only configuration
     route = args_route.route or "acc"
-    if route == "gns":
-        ev = cfg.get("eval_gns", cfg.get("eval", {}))
-    else:
-        ev = cfg.get("eval", {})
+    ev = cfg.get("eval", {})
     rt = cfg.get("runtime", {})
 
     ap = argparse.ArgumentParser("Evaluate a trained single-route model", parents=[pre])
-    ap.add_argument("--route", choices=["acc","gyr","vis","gns"], default=ev.get("route","acc"))
+    ap.add_argument("--route", choices=["acc","gyr"], default=ev.get("route","acc"))
     ap.add_argument("--npz", required=(ev.get("npz") is None), default=ev.get("npz"))
     ap.add_argument("--model", required=(ev.get("model") is None), default=ev.get("model"))
-    ap.add_argument("--x_mode", choices=["both","route_only","imu","visual"], default=ev.get("x_mode","both"))
+    ap.add_argument("--x_mode", choices=["both","route_only","imu"], default=ev.get("x_mode","both"))
     ap.add_argument("--device", default=rt.get("device","cuda" if torch.cuda.is_available() else "cpu"))
     # 增加新参数
     ap.add_argument("--nu", type=float, default=0.0, help="Student-t 自由度（评测口径）；0 表示用高斯口径")
-    ap.add_argument("--post_scale_json", type=str, default=None, help="按轴温度缩放系数 JSON（评测时应用）")
-    ap.add_argument("--est_post_scale_from", type=str, default=None, help="从此 npz（一般是val集）估计按轴温度缩放")
-    ap.add_argument("--save_post_scale_to", type=str, default=None, help="把估计的缩放系数保存到 JSON")
     ap.add_argument("--manifest", type=str, default=None, help="manifest.json from split_eachseq_merge_npz.py")
     ap.add_argument("--plots_dir", type=str, default=None, help="where to save per-sequence plots (.png)")
     
@@ -48,54 +42,22 @@ def parse_args():
                    help='upper clamp for predicted log-variance')
     
     # 温度校正参数
-    ap.add_argument('--auto_temp', choices=['off','global','per-seq'], default='off',
-                   help='temperature calibration mode for plotting/metrics')
+    ap.add_argument('--auto_temp', choices=['off','global'], default='off',
+                   help='Temperature calibration mode')
     ap.add_argument('--calib_npz', type=str, default=None,
-                   help='npz used to estimate global temperature; if None, use the --npz')
+                   help='NPZ file for calibration (defaults to test set)')
     ap.add_argument('--logvar_offset', type=float, default=0.0,
                    help='additive offset to log-variance (applied after auto_temp)')
     
     return ap.parse_args()
-
-def _apply_post_scale(logv: torch.Tensor, c_axis: torch.Tensor | None) -> torch.Tensor:
-    if c_axis is None:
-        return logv
-    return logv + c_axis.log().view(1,1,-1).to(logv.device, logv.dtype)
-
-@torch.no_grad()
-def _estimate_post_scale_gns_axes(model, dl, device, logv_min, logv_max, nu: float) -> torch.Tensor:
-    """在验证集估 c_axis = E[z²]/target（target=t:nu/(nu-2), 否则=1）"""
-    num = torch.zeros(3, device=device)
-    den = torch.zeros(3, device=device)
-    target = nu/(nu-2.0) if (nu and nu>2.0) else 1.0
-    for batch in dl:
-        b = to_device(batch, device)
-        logv = model(b["X"])
-        lv = torch.clamp(logv, min=logv_min, max=logv_max)
-        v  = torch.exp(lv).clamp_min(1e-12)
-        e2 = b["E2_AXES"]; m = b["MASK_AXES"].float()
-        z2 = e2 / v
-        num += (z2 * m).sum(dim=(0,1))
-        den += m.sum(dim=(0,1)).clamp_min(1.0)
-    ez2 = num / den
-    c = (ez2 / target).clamp_min(1e-6)  # (3,)
-    return c.detach()
 
 def main():
     args = parse_args()
     ds, dl = dataset.build_loader(args.npz, route=args.route, x_mode=args.x_mode, batch_size=64, shuffle=False, num_workers=0)
 
     # 动态确定输入/输出维度
-    if args.route == "gns":
-        sample_batch = next(iter(dl))
-        d_in = sample_batch["X"].shape[-1]
-        d_out = 3                      # ← 各向异性：ENU 三通道
-    elif args.route == "vis":
-        d_in = ds.X_all.shape[-1]
-        d_out = 1
-    else:
-        d_in = ds.X_all.shape[-1] if args.x_mode=="both" else 3
-        d_out = 1
+    d_in = ds.X_all.shape[-1] if args.x_mode=="both" else 3
+    d_out = 1
     
     # Load checkpoint (weights_only for newer torch; fallback for older)
     try:
@@ -138,72 +100,39 @@ def main():
             
             # 收集原始数据用于全局温度校正
             if args.auto_temp == "global":
-                if args.route in ("acc", "gyr"):
-                    e2_data = batch["E2"]
-                    if e2_data.size(-1) == 3:  # 步级标签，三轴求和
-                        e2sum_temp = e2_data.sum(dim=-1)  # (B,T)
-                    else:  # 回退模式
-                        e2sum_temp = e2_data.squeeze(-1)  # (B,T)
-                    all_e2sum_raw.append(e2sum_temp.detach().cpu().numpy())
-                    all_logv_raw.append(logv.detach().cpu().numpy())
-                    all_mask_raw.append(batch["MASK"].detach().cpu().numpy())
-                elif args.route == "vis":
-                    # VIS 路由收集数据
-                    e2_data = batch["E2"]
-                    e2_data = e2_data.squeeze(-1) if e2_data.dim() == 3 else e2_data
-                    all_e2sum_raw.append(e2_data.detach().cpu().numpy())
-                    all_logv_raw.append(logv.detach().cpu().numpy())
-                    all_mask_raw.append(batch["MASK"].detach().cpu().numpy())
-                    # 如果有对角监督，也收集
-                    if "E2X" in batch and "E2Y" in batch:
-                        if not hasattr(args, '_vis_diag_calib_data'):
-                            args._vis_diag_calib_data = {'e2x': [], 'e2y': []}
-                        e2x = batch["E2X"].squeeze(-1) if batch["E2X"].dim() == 3 else batch["E2X"]
-                        e2y = batch["E2Y"].squeeze(-1) if batch["E2Y"].dim() == 3 else batch["E2Y"]
-                        args._vis_diag_calib_data['e2x'].append(e2x.detach().cpu().numpy())
-                        args._vis_diag_calib_data['e2y'].append(e2y.detach().cpu().numpy())
-            
+                e2_data = batch["E2"]
+                if e2_data.size(-1) == 3:  # 步级标签，三轴求和
+                    e2sum_temp = e2_data.sum(dim=-1)  # (B,T)
+                else:  # 回退模式
+                    e2sum_temp = e2_data.squeeze(-1)  # (B,T)
+                all_e2sum_raw.append(e2sum_temp.detach().cpu().numpy())
+                all_logv_raw.append(logv.detach().cpu().numpy())
+                all_mask_raw.append(batch["MASK"].detach().cpu().numpy())
             # 应用手工偏置（auto_temp会在后面重新计算时应用）
             if args.auto_temp != "global":
                 logv_applied = logv + args.logvar_offset
             else:
                 logv_applied = logv  # 温度校正模式下先不应用偏置
             
-            # 收集数据用于按序列分析
-            if args.manifest and args.plots_dir:
-                if args.route == "vis":
-                    e2sum = batch["E2"].squeeze(-1) if batch["E2"].dim() == 3 else batch["E2"]
-                    mask = batch["MASK"]
-                elif args.route == "gns":
-                    # GNSS路由不支持按序列分析，跳过收集
-                    e2sum = None
-                    mask = None
-                else:
-                    # IMU路由：处理步级标签
-                    e2_data = batch["E2"]
-                    if e2_data.size(-1) == 3:  # 步级标签，三轴求和
-                        e2sum = e2_data.sum(dim=-1)  # (B,T)
-                    else:  # 回退模式
-                        e2sum = e2_data.squeeze(-1)  # (B,T)
-                    mask = batch["MASK"]
-                
-                if e2sum is not None:
-                    all_e2sum.append(e2sum.detach().cpu().numpy())
-                    all_logv.append(logv.detach().cpu().numpy())  # 保存原始logv用于后续校正
-                    all_mask.append(mask.detach().cpu().numpy())
-            
-            if args.route == "vis":
-                st = route_metrics_vis(batch["E2"], logv_applied, batch["MASK"],
-                                     logv_min=args.logv_min, logv_max=args.logv_max,
-                                     yvar=None)  # VIS路由不传yvar，避免异常指标
-            elif args.route == "gns":
-                st = route_metrics_gns_axes(batch["E2_AXES"], logv_applied, batch["MASK_AXES"],
-                                     logv_min=args.logv_min, logv_max=args.logv_max)
-            else:
-                st = route_metrics_imu(batch["E2"], logv_applied, batch["MASK"],
-                                     logv_min=args.logv_min, logv_max=args.logv_max,
-                                     yvar=batch.get("Y", None))
+            # 统一先算一次指标
+            st = route_metrics_imu(batch["E2"], logv_applied, batch["MASK"],
+                                 logv_min=args.logv_min, logv_max=args.logv_max,
+                                 yvar=batch.get("Y", None))
             all_stats.append(st)
+            
+            # 若需要按序列画图，再额外收集原始数据
+            if args.manifest and args.plots_dir:
+                # IMU路由：处理步级标签
+                e2_data = batch["E2"]
+                if e2_data.size(-1) == 3:  # 步级标签，三轴求和
+                    e2sum = e2_data.sum(dim=-1)  # (B,T)
+                else:  # 回退模式
+                    e2sum = e2_data.squeeze(-1)  # (B,T)
+                mask = batch["MASK"]
+                
+                all_e2sum.append(e2sum.detach().cpu().numpy())
+                all_logv.append(logv.detach().cpu().numpy())  # 保存原始logv用于后续校正
+                all_mask.append(mask.detach().cpu().numpy())
     
     # 准备按序列分析的数据
     if args.manifest and args.plots_dir and all_e2sum:
@@ -214,9 +143,9 @@ def main():
         if LOGV.ndim == 2:  # 统一成 (N,T,1)
             LOGV = LOGV[..., None]
 
-    # ===== 全局温度校正（IMU & VIS）=====
+    # ===== 全局温度校正（IMU）=====
     delta_logvar = 0.0
-    if args.auto_temp == "global" and args.route in ("acc", "gyr", "vis"):
+    if args.auto_temp == "global" and args.route in ("acc", "gyr"):
         import numpy as np
         print("[global_temp] 计算全局温度校正（均值z²法）...")
 
@@ -247,13 +176,8 @@ def main():
             logv_flat  = np.concatenate(all_logv_raw,  axis=0)
             mask_flat  = np.concatenate(all_mask_raw,  axis=0)
 
-        # Handle 2D diagonal mode
-        is_2d_diag = (logv_flat.ndim == 3 and logv_flat.shape[-1] == 2)
-        
-        if is_2d_diag:
-            # 2D diagonal: compute temperature using averaged logvar
-            logv_flat_for_temp = logv_flat.mean(axis=-1)  # (N,T,2) -> (N,T)
-        elif logv_flat.ndim == 3 and logv_flat.shape[-1] == 1:
+        # Handle logv dimensions
+        if logv_flat.ndim == 3 and logv_flat.shape[-1] == 1:
             logv_flat_for_temp = logv_flat.squeeze(-1)
         else:
             logv_flat_for_temp = logv_flat
@@ -280,43 +204,6 @@ def main():
         print(f"[global_temp] 使用 {n_used}/{n_tot} 数据点")
         print(f"[global_temp] delta_logvar = {delta_logvar:+.4f}  (σ×={np.exp(0.5*delta_logvar):.3f})")
         
-        # ==== VIS diagonal mode: per-axis temperature ====
-        if args.route == "vis" and is_2d_diag:
-            print("[global_temp][VIS-diag] 检测到2D对角模式，计算每轴温度校正...")
-            if hasattr(args, '_vis_diag_calib_data'):
-                e2x_flat = np.concatenate(args._vis_diag_calib_data['e2x'], axis=0)
-                e2y_flat = np.concatenate(args._vis_diag_calib_data['e2y'], axis=0)
-                lvx_flat = logv_flat[..., 0]
-                lvy_flat = logv_flat[..., 1]
-                
-                # X轴温度
-                e2x_valid = e2x_flat[valid]
-                lvx_valid = lvx_flat[valid]
-                sigma2x = np.exp(np.clip(lvx_valid, args.logv_min, args.logv_max))
-                z2x = (e2x_valid / sigma2x) / df
-                if z2x.size > 100:
-                    hix = np.percentile(z2x, 99.0)
-                    z2x = z2x[z2x <= hix]
-                mux = float(np.mean(z2x))
-                delta_x = float(np.log(mux))
-                
-                # Y轴温度
-                e2y_valid = e2y_flat[valid]
-                lvy_valid = lvy_flat[valid]
-                sigma2y = np.exp(np.clip(lvy_valid, args.logv_min, args.logv_max))
-                z2y = (e2y_valid / sigma2y) / df
-                if z2y.size > 100:
-                    hiy = np.percentile(z2y, 99.0)
-                    z2y = z2y[z2y <= hiy]
-                muy = float(np.mean(z2y))
-                delta_y = float(np.log(muy))
-                
-                print(f"[global_temp][VIS-diag] Δx={delta_x:+.4f} (σx×={np.exp(0.5*delta_x):.3f})")
-                print(f"[global_temp][VIS-diag] Δy={delta_y:+.4f} (σy×={np.exp(0.5*delta_y):.3f})")
-                
-                # 存储对角温度校正（用于后续应用）
-                args._vis_diag_delta = torch.tensor([delta_x, delta_y], dtype=torch.float32)
-
         # 用校正后的 logv 重算指标
         print("[global_temp] 重新计算校正后指标...")
         all_stats_corrected = []
@@ -325,26 +212,12 @@ def main():
                 b = to_device(batch, args.device)
                 logv = model(b["X"])
                 
-                # 应用温度校正
-                if args.route == "vis":
-                    # VIS 对角模式：应用每轴温度
-                    if hasattr(args, '_vis_diag_delta') and logv.dim() == 3 and logv.size(-1) == 2:
-                        delta_diag = args._vis_diag_delta.to(logv.device, logv.dtype).view(1, 1, 2)
-                        logv_corrected = logv + delta_diag + args.logvar_offset
-                    else:
-                        # VIS 标量模式：应用全局温度
-                        logv_corrected = logv + delta_logvar + args.logvar_offset
-                    st = route_metrics_vis(
-                        b["E2"], logv_corrected, b["MASK"],
-                        logv_min=args.logv_min, logv_max=args.logv_max
-                    )
-                else:
-                    # IMU 路由
-                    st = route_metrics_imu(
-                        b["E2"], logv + delta_logvar + args.logvar_offset, b["MASK"],
-                        logv_min=args.logv_min, logv_max=args.logv_max,
-                        yvar=b.get("Y", None)
-                    )
+                # 应用温度校正（IMU 路由）
+                st = route_metrics_imu(
+                    b["E2"], logv + delta_logvar + args.logvar_offset, b["MASK"],
+                    logv_min=args.logv_min, logv_max=args.logv_max,
+                    yvar=b.get("Y", None)
+                )
                 all_stats_corrected.append(st)
         all_stats = all_stats_corrected
         print("[global_temp] 温度校正完成！")
@@ -367,53 +240,6 @@ def main():
                 agg[k] = values[0]
     else:
         agg = {}
-    
-    # ==== GNSS逐维分析（支持t口径+post_scale）====
-    if args.route == "gns":
-        import numpy as np
-        # —— 可选：从 val 集估计 post_scale 并存盘 ——
-        c_axis = None
-        if args.est_post_scale_from:
-            ds_val, dl_val = dataset.build_loader(args.est_post_scale_from, route="gns", x_mode=args.x_mode,
-                                                  batch_size=64, shuffle=False, num_workers=0)
-            c_axis = _estimate_post_scale_gns_axes(model, dl_val, args.device,
-                                                   args.logv_min, args.logv_max,
-                                                   args.nu)
-            if args.save_post_scale_to:
-                Path(args.save_post_scale_to).write_text(jsonlib.dumps({
-                    "axis": ["E","N","U"], "c_axis": c_axis.cpu().tolist(),
-                    "nu": args.nu, "target": (args.nu/(args.nu-2.0) if (args.nu and args.nu>2.0) else 1.0)
-                }, ensure_ascii=False, indent=2))
-                print("[post_scale] saved to:", args.save_post_scale_to)
-        # —— 可选：从 json 载入 post_scale ——
-        if (c_axis is None) and args.post_scale_json:
-            js = jsonlib.loads(Path(args.post_scale_json).read_text())
-            c_axis = torch.tensor(js["c_axis"], dtype=torch.float32, device=args.device)
-
-        # —— 汇总所有批次：注意应用 post_scale 到 logv ——
-        all_e2, all_v, all_m = [], [], []
-        with torch.no_grad():
-            for batch in dl:
-                b = to_device(batch, args.device)
-                logv = model(b["X"])                       # (B,T,3)
-                if c_axis is not None:
-                    logv = _apply_post_scale(logv, c_axis) # 应用按轴温度缩放
-                lv = torch.clamp(logv, min=args.logv_min, max=args.logv_max)
-                var = torch.exp(lv).clamp_min(1e-12)
-                all_e2.append(b["E2_AXES"].cpu()); all_v.append(var.cpu()); all_m.append(b["MASK_AXES"].cpu())
-
-        e2_axes = torch.cat(all_e2, 0); var_axes = torch.cat(all_v, 0); mask_axes = torch.cat(all_m, 0)
-
-        # 指标（t 口径 + 高斯口径对照 + 可靠性）
-        st_axes = route_metrics_gns_axes(e2_axes, var_axes.log(), mask_axes,
-                                         args.logv_min, args.logv_max,
-                                         nu=args.nu)
-        # 保存
-        out_dir = Path(args.model).parent
-        (out_dir/"per_axis.json").write_text(jsonlib.dumps(st_axes, ensure_ascii=False, indent=2))
-        print("[gns] per-axis metrics saved to", out_dir/"per_axis.json")
-        
-        agg["per_axis"] = st_axes
     
     print(jsonlib.dumps(agg, indent=2, ensure_ascii=False))
 
@@ -482,25 +308,17 @@ def main():
 
 
             e2sum = E2SUM[sl]             # (n,T)
-            logv  = LOGV[sl]              # (n,T,1) or (n,T,2) for 2D diagonal
+            logv  = LOGV[sl]              # (n,T,1) or (n,T,3) for per-axis
             mask  = MASK[sl]              # (n,T)
 
             # 应用温度校正 + 手工偏置到按序列数据
-            if hasattr(args, '_vis_diag_delta') and logv.ndim == 3 and logv.shape[-1] == 2:
-                # 2D diagonal: apply per-axis temperature
-                delta_diag_np = args._vis_diag_delta.cpu().numpy().reshape(1, 1, 2)
-                logv_corrected = logv + delta_diag_np + args.logvar_offset
-            else:
-                logv_corrected = logv + delta_logvar + args.logvar_offset
+            logv_corrected = logv + delta_logvar + args.logvar_offset
             
             # 计算该序列的指标
             t_e2 = torch.from_numpy(e2sum)
             t_lv = torch.from_numpy(logv_corrected)  # 使用校正后的logv
             t_mk = torch.from_numpy(mask)
-            if args.route == "vis":
-                stats = route_metrics_vis(t_e2, t_lv, t_mk, logv_min=args.logv_min, logv_max=args.logv_max)
-            else:
-                stats = route_metrics_imu(t_e2, t_lv, t_mk, logv_min=args.logv_min, logv_max=args.logv_max)
+            stats = route_metrics_imu(t_e2, t_lv, t_mk, logv_min=args.logv_min, logv_max=args.logv_max)
             stats = {k: (v.item() if hasattr(v, "item") else float(v)) for k,v in stats.items()}
             per_seq_metrics[fname] = stats
 
@@ -508,11 +326,8 @@ def main():
             # 1) z^2 直方图（掩码内）
             df = float(DF_BY_ROUTE.get(args.route, 3))  # 使用统一的自由度定义
             
-            # Handle 2D diagonal mode
-            if logv_corrected.ndim == 3 and logv_corrected.shape[-1] == 2:
-                # 2D diagonal: average the two axes for visualization
-                v = np.exp(np.clip(logv_corrected.mean(axis=-1), args.logv_min, args.logv_max))  # (n,T)
-            elif logv_corrected.ndim == 3 and logv_corrected.shape[-1] == 1:
+            # Handle logv dimensions
+            if logv_corrected.ndim == 3 and logv_corrected.shape[-1] == 1:
                 v = np.exp(np.clip(logv_corrected, args.logv_min, args.logv_max))[:, :, 0]  # (n,T)
             else:
                 v = np.exp(np.clip(logv_corrected, args.logv_min, args.logv_max))  # (n,T)

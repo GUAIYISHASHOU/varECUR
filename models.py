@@ -41,10 +41,6 @@ class IMURouteModel(nn.Module):
         enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=d_model*4, dropout=dropout, activation="gelu", batch_first=True, norm_first=True)
         self.tf = nn.TransformerEncoder(enc_layer, num_layers=n_layers_tf)
         self.head = nn.Linear(d_model, d_out)
-        
-        # >>> VIS-CALIB: learnable global log-variance bias for VIS
-        if route == "vis":
-            self.logv_bias = nn.Parameter(torch.zeros(1))  # scalar temperature initialized at zero
 
     def forward(self, x):  # x: (B,T,D_in)
         h = self.inp(x)           # (B,T,C)
@@ -53,11 +49,6 @@ class IMURouteModel(nn.Module):
         h = h.transpose(1,2)      # (B,T,C)
         h = self.tf(h)            # (B,T,C)
         logv = self.head(h)       # (B,T,D_out)
-        
-        # VIS分支：应用内置温度参�?
-        if self.route == "vis" and hasattr(self, 'logv_bias'):
-            logv = logv + self.logv_bias  # 训练期、验证期统一使用
-        
         return logv
 
 
