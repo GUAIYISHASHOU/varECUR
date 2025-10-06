@@ -1,0 +1,36 @@
+# 一个更均衡的划分方案
+SPLIT = {
+    "train": [
+        "V1_01_easy", "V2_01_easy", "MH_01_easy", "MH_02_easy",
+        "V1_02_medium", "V2_02_medium",
+        "V1_03_difficult", "MH_05_difficult" # 将困难序列也混入训练集
+    ],
+    "val": [
+        "MH_03_medium", # 使用一个中等难度序列
+        "MH_04_difficult" # 和一个困难序列
+    ],
+    "test": ["V2_03_difficult"], # 测试集保持不变
+}
+
+
+
+(F:\condaEVN\LAP3GPU) PS F:\lstmattentionPROGRAM\IMU_2_test> python train_vis.py `
+>>   --train_npz F:/SLAMdata/_cache/vis_split/train.npz `
+>>   --val_npz F:/SLAMdata/_cache/vis_split/val.npz `
+>>   --save_dir runs/vis_resnet_crossattn_revived `
+>>   --epochs 60 `
+>>   --batch 256 `
+>>   --loss studentt `
+>>   --nu 5.0 `
+>>   --lv_min -10 `
+>>   --lv_max 10 `
+>>   --lr 3e-4 `
+>>   --scheduler cosine `
+>>   --lr_min 1e-6 `
+>>   --photometric clahe `
+>>   --grad_thr 0.03 `
+>>   --grad_scale 8 `
+>>   --w_gamma 3.0 `
+>>   --err_clip_px 15.0 `
+>>   --calib_reg 1e-3 `
+>>   --early_stop 8 

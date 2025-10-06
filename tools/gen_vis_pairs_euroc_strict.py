@@ -261,6 +261,68 @@ def match_bf(d0, d1):
     matches = sorted(matches, key=lambda r: r.distance)
     return np.array([[m.queryIdx, m.trainIdx] for m in matches], int)
 
+# ---------- Advanced Filtering ----------
+def skew3(v):
+    """Skew-symmetric matrix for cross product."""
+    return np.array([[0, -v[2], v[1]], 
+                     [v[2], 0, -v[0]], 
+                     [-v[1], v[0], 0]], dtype=np.float64)
+
+def sampson_err_norm(x1n, x0n, R, t):
+    """
+    Compute Sampson (first-order geometric) epipolar error.
+    
+    Args:
+        x1n, x0n: [N,2] normalized coordinates (undistorted)
+        R, t: Relative rotation and translation (cam1 ← cam0)
+    
+    Returns:
+        err: [N] Sampson error in normalized image plane (≈radians for small errors)
+    """
+    x0 = np.hstack([x0n, np.ones((x0n.shape[0], 1))])
+    x1 = np.hstack([x1n, np.ones((x1n.shape[0], 1))])
+    
+    E = skew3(t) @ R  # Essential matrix
+    Ex0 = (E @ x0.T).T
+    ETx1 = (E.T @ x1.T).T
+    x1Ex0 = np.sum(x1 * (E @ x0.T).T, axis=1)
+    
+    num = x1Ex0 ** 2
+    den = Ex0[:, 0]**2 + Ex0[:, 1]**2 + ETx1[:, 0]**2 + ETx1[:, 1]**2 + 1e-12
+    
+    return np.sqrt(num / den)
+
+def precompute_grad_corner(path_list):
+    """
+    Precompute gradient magnitude and corner response for all frames.
+    
+    Returns:
+        grads: list of gradient magnitude images (H×W float32)
+        corners: list of corner response images (H×W float32)
+    """
+    grads, corners = [], []
+    print(f"[precompute] Computing gradients and corners for {len(path_list)} frames...")
+    
+    for p in path_list:
+        img = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            grads.append(None)
+            corners.append(None)
+            continue
+        
+        # Sobel gradient magnitude
+        gX = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+        gY = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+        gmag = np.sqrt(gX*gX + gY*gY)
+        
+        # Corner response (eigenvalue-based)
+        corn = cv2.cornerMinEigenVal(img, blockSize=3, ksize=3)
+        
+        grads.append(gmag.astype(np.float32))
+        corners.append(corn.astype(np.float32))
+    
+    return grads, corners
+
 # ---------- Main Pipeline ----------
 def main():
     ap = argparse.ArgumentParser("Generate VIS pairs with strict GT geometry")
@@ -279,7 +341,28 @@ def main():
     ap.add_argument("--min_frames", type=int, default=0,
                    help="Minimum frames to cover before stopping (0=no requirement)")
     
+    # NEW: Multi-delta support
+    ap.add_argument("--deltas", type=str, default=None,
+                   help="Comma-separated frame intervals (e.g., '1,2'); if empty, use --delta single value")
+    
+    # NEW: Filtering thresholds
+    ap.add_argument("--err_clip_px", type=float, default=15.0, 
+                   help="Pixel error threshold (filter extreme outliers)")
+    ap.add_argument("--depth_min", type=float, default=0.1, help="Min depth (m)")
+    ap.add_argument("--depth_max", type=float, default=80.0, help="Max depth (m)")
+    ap.add_argument("--epi_thr_px", type=float, default=1.5, 
+                   help="Sampson epipolar error threshold (normalized image plane)")
+    
+    # NEW: Texture stratification
+    ap.add_argument("--texture_strat", action="store_true",
+                   help="Enable texture stratification (7:3 high:low gradient)")
+    
     args = ap.parse_args()
+    
+    # Parse multi-delta
+    deltas = [int(x) for x in args.deltas.split(",")] if args.deltas else [args.delta]
+    print(f"[config] deltas={deltas}, err_clip={args.err_clip_px}px, epi_thr={args.epi_thr_px}, "
+          f"depth=[{args.depth_min}, {args.depth_max}]m")
     
     root = Path(args.euroc_root) / args.seq / "mav0"
     
@@ -297,16 +380,28 @@ def main():
     Tcam1_imu = invSE3(Timu_cam1)
     Tcam1_cam0 = Tcam1_imu @ Timu_cam0  # Cam1 ← Cam0
     
-    # Align lengths
-    n = min(len(ts0), len(ts1)) - args.delta
+    # Align lengths (use max delta for safety)
+    max_delta = max(deltas)
+    n = min(len(ts0), len(ts1)) - max_delta
     ts0 = ts0[:n]
     p0 = p0[:n]
     p1 = p1[:n]
     
-    # Pre-interpolate IMU poses at t and t+Δ
-    print(f"[interp] Computing GT poses for {n} frames...")
+    # Pre-interpolate IMU poses at t for each delta
+    print(f"[interp] Computing GT poses for {n} frames at deltas={deltas}...")
     T_w_imu_t = interp_pose(ts0, gt_t, gt_p, gt_q)
-    T_w_imu_tpd = interp_pose(ts0 + (ts0[1] - ts0[0]) * args.delta, gt_t, gt_p, gt_q)
+    
+    # Create dict of poses for each delta
+    frame_dt = ts0[1] - ts0[0] if len(ts0) > 1 else 1e9
+    T_w_imu_deltas = {}
+    for d in deltas:
+        T_w_imu_deltas[d] = interp_pose(ts0 + frame_dt * d, gt_t, gt_p, gt_q)
+    
+    # NEW: Precompute gradients and corners for texture stratification
+    grads0, corners0 = None, None
+    if args.texture_strat:
+        grads0, corners0 = precompute_grad_corner(p0)
+        print(f"[precompute] Gradient/corner maps ready for texture stratification")
     
     I0P, I2P, GEOM, E2X, E2Y, MASK = [], [], [], [], [], []
     
@@ -324,16 +419,14 @@ def main():
         pbar = frame_indices
     
     for i in pbar:
-        
-        # Read images
+        # Read reference images (stereo at time t)
         I0 = cv2.imread(str(p0[i]), cv2.IMREAD_GRAYSCALE)
         I1 = cv2.imread(str(p1[i]), cv2.IMREAD_GRAYSCALE)
-        I2 = cv2.imread(str(p0[i + args.delta]), cv2.IMREAD_GRAYSCALE)
         
-        if I0 is None or I1 is None or I2 is None:
+        if I0 is None or I1 is None:
             continue
         
-        # Stereo matching @ t
+        # Stereo matching @ t (done once per frame)
         x0, d0, s0 = orb_det_desc(I0)
         x1, d1, s1 = orb_det_desc(I1)
         
@@ -352,109 +445,201 @@ def main():
         x1n = undist_norm(K1, D1, x1m)
         X3d = triangulate(K0, K1, Tcam1_cam0, x0n, x1n)  # in cam0@t
         
-        # Compute relative pose: Cam0(t+Δ) ← Cam0(t)
         Twi = T_w_imu_t[i]
-        Twj = T_w_imu_tpd[i]
-        T_cj_ci = invSE3(Twj @ Timu_cam0) @ (Twi @ Timu_cam0)
         
-        R = T_cj_ci[:3, :3]
-        t = T_cj_ci[:3, 3]
-        Xj = (R @ X3d.T + t.reshape(3, 1)).T  # Transform to cam0@(t+Δ)
-        
-        # Temporal matching: left t → left t+Δ
-        x2, d2, s2 = orb_det_desc(I2)
-        if x2 is None:
-            continue
-        
-        m02 = match_bf(d0, d2)
-        if len(m02) < 40:
-            continue
-        
-        q0 = x0[m02[:, 0]]
-        u2 = x2[m02[:, 1]]
-        
-        # Align 3D points with temporal matches using nearest neighbor
-        if len(q0) == 0 or len(Xj) == 0:
-            continue
-        
-        # Vectorized nearest neighbor (O(NM), sufficient for typical patch counts)
-        diff = q0[:, None, :] - x0m[None, :, :]
-        dist = np.sqrt(np.sum(diff * diff, axis=2))
-        nn = np.argmin(dist, axis=1)
-        # Adaptive threshold: looser when skipping frames (more motion)
-        thr = 4.0 if args.frame_step > 1 else 2.5
-        sel = (dist[np.arange(len(q0)), nn] < thr)
-        
-        if sel.sum() < 20:
-            continue
-        
-        X_sel = Xj[nn[sel]]
-        u2_obs = u2[sel]
-        
-        # Predict pixel locations and compute residuals
-        u2_pred = project(K0, X_sel)
-        e = (u2_obs - u2_pred).astype(np.float32)
-        e2 = e * e
-        m = np.isfinite(e2).all(axis=1)
-        
-        if m.sum() == 0:
-            continue
-        
-        # Outlier filtering (CRITICAL for training stability)
-        err = np.sqrt(e2.sum(axis=1))  # Pixel error norm
-        
-        # 1. Depth check: positive and reasonable range (0.1-80m)
-        depth_ok = (X_sel[:, 2] > 0.1) & (X_sel[:, 2] < 80.0)
-        
-        # 2. In-image check: predicted projection within bounds
-        H, W = I2.shape[:2]
-        in_img = (u2_pred[:,0] >= 0) & (u2_pred[:,0] < W) & \
-                 (u2_pred[:,1] >= 0) & (u2_pred[:,1] < H)
-        
-        # 3. Reprojection error check: filter extreme outliers (>20px)
-        err_ok = (err < 20.0)
-        
-        # Combined validity mask
-        good_pair = depth_ok & in_img & err_ok
-        
-        # Crop patches
-        P0, ok0 = crop_patches(I0, q0[sel], patch=args.patch)
-        P2, ok2 = crop_patches(I2, u2_obs, patch=args.patch)
-        keep = m & ok0 & ok2 & good_pair
-        
-        if keep.sum() == 0:
-            continue
-        
-        # Per-frame sampling cap (for uniform coverage)
-        if args.per_frame_cap > 0 and keep.sum() > args.per_frame_cap:
-            idx = np.flatnonzero(keep)
-            sel_idx = np.random.choice(idx, size=args.per_frame_cap, replace=False)
-            keep_sampled = np.zeros_like(keep, dtype=bool)
-            keep_sampled[sel_idx] = True
-            keep = keep_sampled
-        
-        if keep.sum() == 0:
-            continue
-        
-        frames_covered += 1
-        
-        # Store data
-        I0P.append(P0[keep][:, None, :, :])
-        I2P.append(P2[keep][:, None, :, :])
-        E2X.append(e2[keep, 0])
-        E2Y.append(e2[keep, 1])
-        MASK.append(np.ones((keep.sum(),), np.float32))
-        
-        # Geometric context
-        g = []
-        for (u0, v0), (u, v) in zip(q0[sel][keep], u2_obs[keep]):
-            g.append([
-                u0 / I0.shape[1] * 2 - 1, 
-                v0 / I0.shape[0] * 2 - 1,
-                u / I2.shape[1] * 2 - 1, 
-                v / I2.shape[0] * 2 - 1
-            ])
-        GEOM.append(np.array(g, np.float32))
+        # === Loop over deltas (multi-temporal) ===
+        for d in deltas:
+            if i + d >= n:
+                continue
+            
+            # Read target image at t+delta
+            I2 = cv2.imread(str(p0[i + d]), cv2.IMREAD_GRAYSCALE)
+            if I2 is None:
+                continue
+            
+            # Compute relative pose: Cam0(t+Δ) ← Cam0(t)
+            Twj = T_w_imu_deltas[d][i]
+            T_cj_ci = invSE3(Twj @ Timu_cam0) @ (Twi @ Timu_cam0)
+            
+            R01 = T_cj_ci[:3, :3]
+            t01 = T_cj_ci[:3, 3]
+            Xj = (R01 @ X3d.T + t01.reshape(3, 1)).T  # Transform to cam0@(t+Δ)
+            
+            # Temporal matching: left t → left t+Δ
+            x2, d2, s2 = orb_det_desc(I2)
+            if x2 is None:
+                continue
+            
+            m02 = match_bf(d0, d2)
+            if len(m02) < 40:
+                continue
+            
+            q0 = x0[m02[:, 0]]
+            u2_obs = x2[m02[:, 1]]
+            
+            # Align 3D points with temporal matches using nearest neighbor
+            if len(q0) == 0 or len(Xj) == 0:
+                continue
+            
+            # Vectorized nearest neighbor (O(NM), sufficient for typical patch counts)
+            diff = q0[:, None, :] - x0m[None, :, :]
+            dist = np.sqrt(np.sum(diff * diff, axis=2))
+            nn = np.argmin(dist, axis=1)
+            # Adaptive threshold: looser when skipping frames (more motion)
+            thr = 4.0 if args.frame_step > 1 else 2.5
+            sel = (dist[np.arange(len(q0)), nn] < thr)
+            
+            if sel.sum() < 20:
+                continue
+            
+            X_sel = Xj[nn[sel]]
+            u2_obs_final = u2_obs[sel]
+            
+            # Predict pixel locations and compute residuals
+            u2_pred = project(K0, X_sel)
+            e = (u2_obs_final - u2_pred).astype(np.float32)
+            e2 = e * e
+            m = np.isfinite(e2).all(axis=1)
+            
+            if m.sum() == 0:
+                continue
+            
+            # === Advanced Outlier Filtering (NEW) ===
+            err = np.sqrt(e2.sum(axis=1))  # Pixel error norm
+            
+            # 1. Depth check: parameterized range
+            depth_ok = (X_sel[:, 2] > args.depth_min) & (X_sel[:, 2] < args.depth_max)
+            
+            # 2. In-image check: predicted projection within bounds
+            H, W = I2.shape[:2]
+            in_img = (u2_pred[:,0] >= 0) & (u2_pred[:,0] < W) & \
+                     (u2_pred[:,1] >= 0) & (u2_pred[:,1] < H)
+            
+            # 3. Reprojection error check: parameterized threshold
+            err_ok = (err < args.err_clip_px)
+            
+            # 4. NEW: Sampson epipolar error (geometric consistency)
+            x0n_temp = undist_norm(K0, D0, q0[sel])
+            x2n_temp = undist_norm(K0, D0, u2_obs_final)
+            epi_err = sampson_err_norm(x2n_temp, x0n_temp, R01, t01)
+            epi_ok = (epi_err < args.epi_thr_px)
+            
+            # Combined validity mask
+            good_pair = depth_ok & in_img & err_ok & epi_ok
+            
+            # Crop patches
+            P0, ok0 = crop_patches(I0, q0[sel], patch=args.patch)
+            P2, ok2 = crop_patches(I2, u2_obs_final, patch=args.patch)
+            keep = m & ok0 & ok2 & good_pair
+            
+            if keep.sum() == 0:
+                continue
+            
+            # === NEW: Texture stratification (7:3 high:low gradient) ===
+            if args.texture_strat and grads0 is not None and grads0[i] is not None:
+                g0_vals = grads0[i]
+                # Sample gradient values at q0 locations
+                xy = q0[sel][keep].astype(np.float32)
+                mapx = xy[:, 0].reshape(-1, 1)
+                mapy = xy[:, 1].reshape(-1, 1)
+                g_samp = cv2.remap(g0_vals, mapx, mapy, cv2.INTER_LINEAR, 
+                                  borderMode=cv2.BORDER_REPLICATE).reshape(-1)
+                
+                thr = np.quantile(g_samp, 0.7) if g_samp.size > 10 else 0.0
+                hi = (g_samp >= thr)
+                lo = ~hi
+                
+                idx_all = np.flatnonzero(keep)
+                if args.per_frame_cap > 0 and len(idx_all) > args.per_frame_cap:
+                    k_hi = int(args.per_frame_cap * 0.7)
+                    k_lo = args.per_frame_cap - k_hi
+                    
+                    def choice(mask, k):
+                        I = np.flatnonzero(mask)
+                        if I.size <= k: return I
+                        return np.random.choice(I, size=k, replace=False)
+                    
+                    pick = np.concatenate([choice(hi, k_hi), choice(lo, k_lo)], axis=0)
+                    tmp = np.zeros_like(hi, dtype=bool)
+                    tmp[pick] = True
+                    keep_new = np.zeros_like(keep, dtype=bool)
+                    keep_new[idx_all[tmp]] = True
+                    keep = keep_new
+            else:
+                # Per-frame sampling cap (uniform, no stratification)
+                if args.per_frame_cap > 0 and keep.sum() > args.per_frame_cap:
+                    idx = np.flatnonzero(keep)
+                    sel_idx = np.random.choice(idx, size=args.per_frame_cap, replace=False)
+                    keep_sampled = np.zeros_like(keep, dtype=bool)
+                    keep_sampled[sel_idx] = True
+                    keep = keep_sampled
+            
+            if keep.sum() == 0:
+                continue
+            
+            frames_covered += 1
+            
+            # Store basic data
+            I0P.append(P0[keep][:, None, :, :])
+            I2P.append(P2[keep][:, None, :, :])
+            E2X.append(e2[keep, 0])
+            E2Y.append(e2[keep, 1])
+            MASK.append(np.ones((keep.sum(),), np.float32))
+            
+            # === NEW: Enhanced geometric context with texture features ===
+            xy0 = q0[sel][keep].astype(np.float32)
+            xy2 = u2_obs_final[keep].astype(np.float32)
+            
+            # Normalized pixel coordinates ([-1, 1])
+            u0n_norm = xy0[:, 0] / I0.shape[1] * 2 - 1
+            v0n_norm = xy0[:, 1] / I0.shape[0] * 2 - 1
+            u2n_norm = xy2[:, 0] / I2.shape[1] * 2 - 1
+            v2n_norm = xy2[:, 1] / I2.shape[0] * 2 - 1
+            
+            # NEW: Sample gradient and corner features
+            if grads0 is not None and grads0[i] is not None:
+                mapx0 = xy0[:, 0].reshape(-1, 1)
+                mapy0 = xy0[:, 1].reshape(-1, 1)
+                g0s = cv2.remap(grads0[i], mapx0, mapy0, cv2.INTER_LINEAR, 
+                               borderMode=cv2.BORDER_REPLICATE).reshape(-1)
+                c0s = cv2.remap(corners0[i], mapx0, mapy0, cv2.INTER_LINEAR,
+                               borderMode=cv2.BORDER_REPLICATE).reshape(-1)
+                
+                if grads0[i+d] is not None:
+                    mapx2 = xy2[:, 0].reshape(-1, 1)
+                    mapy2 = xy2[:, 1].reshape(-1, 1)
+                    g2s = cv2.remap(grads0[i+d], mapx2, mapy2, cv2.INTER_LINEAR,
+                                   borderMode=cv2.BORDER_REPLICATE).reshape(-1)
+                    c2s = cv2.remap(corners0[i+d], mapx2, mapy2, cv2.INTER_LINEAR,
+                                   borderMode=cv2.BORDER_REPLICATE).reshape(-1)
+                else:
+                    g2s = np.zeros_like(g0s)
+                    c2s = np.zeros_like(c0s)
+            else:
+                # Fallback: zero features
+                g0s = np.zeros(len(xy0), dtype=np.float32)
+                g2s = np.zeros(len(xy0), dtype=np.float32)
+                c0s = np.zeros(len(xy0), dtype=np.float32)
+                c2s = np.zeros(len(xy0), dtype=np.float32)
+            
+            # Optical flow magnitude
+            flow = np.linalg.norm(xy2 - xy0, axis=1).astype(np.float32)
+            
+            # Baseline (translation norm)
+            baseline = np.full_like(flow, np.linalg.norm(t01).astype(np.float32))
+            
+            # Parallax angle (viewing angle change)
+            X_sel_keep = X_sel[keep]
+            v0 = X_sel_keep / (np.linalg.norm(X_sel_keep, axis=1, keepdims=True) + 1e-12)
+            v1 = (R01 @ X_sel_keep.T + t01.reshape(3, 1)).T
+            v1 = v1 / (np.linalg.norm(v1, axis=1, keepdims=True) + 1e-12)
+            cosang = np.clip(np.sum(v0 * v1, axis=1), -1.0, 1.0)
+            parallax = np.arccos(cosang).astype(np.float32)
+            
+            # Stack all 11 features: [u0n, v0n, u2n, v2n, g0, g2, c0, c2, flow, baseline, parallax]
+            feat = np.stack([u0n_norm, v0n_norm, u2n_norm, v2n_norm, 
+                            g0s, g2s, c0s, c2s, flow, baseline, parallax], axis=1).astype(np.float32)
+            GEOM.append(feat)
         
         # 更新进度条信息
         current_pairs = sum(len(x) for x in E2X)
@@ -499,6 +684,25 @@ def main():
     total_pairs = sum(len(x) for x in E2X)
     
     try:
+        # Enhanced metadata
+        meta = dict(
+            seq=args.seq,
+            patch=args.patch,
+            deltas=deltas,
+            err_clip_px=args.err_clip_px,
+            depth_min=args.depth_min,
+            depth_max=args.depth_max,
+            epi_thr_px=args.epi_thr_px,
+            texture_strat=args.texture_strat,
+            per_frame_cap=args.per_frame_cap,
+            frame_step=args.frame_step,
+            geom_dim=11 if args.texture_strat or grads0 is not None else 11,  # Always 11 now
+            # Optional: Camera parameters for future factor graph integration
+            # K0=K0.astype(np.float32),
+            # D0=D0.astype(np.float32),
+            # T_cam0_imu=Tcam0_imu.astype(np.float32)
+        )
+        
         np.savez_compressed(
             out,
             I0=_cat(I0P, "I0P"),
@@ -507,9 +711,10 @@ def main():
             e2x=_cat(E2X, "E2X"),
             e2y=_cat(E2Y, "E2Y"),
             mask=_cat(MASK, "MASK"),
-            meta=dict(seq=args.seq, patch=args.patch, delta=args.delta),
+            meta=meta,
         )
         print(f"[OK] Wrote {out}  | N={total_pairs} pairs from {frames_covered} frames")
+        print(f"[OK] geom features: {meta['geom_dim']} dimensions")
     except PermissionError as e:
         print(f"[ERROR] Failed to save NPZ: {e}. 可能是文件被占用（Excel/压缩软件）或无写权限。")
         raise

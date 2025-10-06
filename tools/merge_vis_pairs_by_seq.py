@@ -8,15 +8,43 @@ import argparse
 import numpy as np
 from pathlib import Path
 
-# EuRoC sequence split (按建议划分)
+# EuRoC sequence split (改进版：均衡难度分布)
+# 
+# 旧版问题：训练集主要是easy/medium，验证集只有difficult
+#          导致模型在简单数据上训练，在困难数据上验证 → train降val不降
+# 
+# 新版策略：确保train和val都包含各种难度的混合
+#          训练集包含更多difficult样本，验证集也有easy/medium作为基准
 SPLIT = {
     "train": [
-        "V1_01_easy", "V1_02_medium", "V2_01_easy", "V2_02_medium",
-        "MH_01_easy", "MH_02_easy", "MH_03_medium", "V1_03_difficult"
+        # Easy sequences (4个)
+        "V1_01_easy", "V2_01_easy", "MH_01_easy", "MH_02_easy",
+        # Medium sequences (2个)
+        "V1_02_medium", "V2_02_medium",
+        # Difficult sequences (2个) - 关键改进：增加训练集中的困难样本
+        "V1_03_difficult", "MH_05_difficult"
     ],
-    "val": ["MH_04_difficult"],
-    "test": ["V2_03_difficult", "MH_05_difficult"],
+    "val": [
+        # Medium sequence (1个) - 提供中等难度基准
+        "MH_03_medium",
+        # Difficult sequence (1个) - 保留困难场景验证
+        "MH_04_difficult"
+    ],
+    "test": [
+        # Difficult sequence (1个) - 最终测试集
+        "V2_03_difficult"
+    ],
 }
+
+# 数据分布说明：
+# Train: 4 easy + 2 medium + 2 difficult = 8 序列 (50% easy, 25% medium, 25% difficult)
+# Val:   0 easy + 1 medium + 1 difficult = 2 序列 (50% medium, 50% difficult)
+# Test:  0 easy + 0 medium + 1 difficult = 1 序列 (100% difficult)
+#
+# 这样的划分确保：
+# 1. 训练集有足够的困难样本，模型能学到如何处理挑战性场景
+# 2. 验证集难度适中，既有medium基准，也有difficult挑战
+# 3. 测试集保留最难的序列用于最终评估
 
 def concat_npz(npzs, cap_per_seq=None, seed=0):
     """
