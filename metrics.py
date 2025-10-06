@@ -3,7 +3,7 @@ import math
 import torch
 import numpy as np
 
-# 统一的自由度定义 (VIS removed)
+# 统一的自由度定义
 DF_BY_ROUTE = {"acc": 3, "gyr": 3}
 
 def z2_from_residual(residual, logvar, df):
@@ -19,7 +19,6 @@ def z2_from_residual(residual, logvar, df):
 
 
 def _prepare_inputs(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor):
-    # VIS 2D diagonal mode removed
     if logv.dim() == 3 and logv.size(-1) == 1:
         logv = logv.squeeze(-1)
     
@@ -36,7 +35,6 @@ def _prepare_inputs(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor)
 def _route_metrics(e2sum: torch.Tensor, logv: torch.Tensor, mask: torch.Tensor,
                   logv_min: float, logv_max: float, df: float,
                   yvar: torch.Tensor | None = None) -> dict:
-    # VIS 2D diagonal mode removed
     if logv.dim() == 3 and logv.size(-1) == 1:
         logv = logv.squeeze(-1)
     
