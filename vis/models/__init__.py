@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from .uncert_head import UncertHead2D, UncertHead_ResNet_CrossAttention
+# 旧的微观模式模型已移除
+# 宏观模式使用 models.macro_transformer_sa.MacroTransformerSA
 
-__all__ = ["UncertHead2D", "UncertHead_ResNet_CrossAttention"]
-
+__all__ = []
