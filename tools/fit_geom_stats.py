@@ -12,19 +12,41 @@ def main():
     parser = argparse.ArgumentParser(
         description="计算几何特征的归一化统计量"
     )
-    parser.add_argument("--train_npz", type=str, required=True,
+    parser.add_argument("--train_npz", type=str, default=None,
                         help="训练NPZ文件路径 (例如: train_frame.npz)")
-    parser.add_argument("--out_npz", type=str, required=True,
+    parser.add_argument("--npz_dir", type=str, default=None,
+                        help="包含NPZ文件的目录路径")
+    parser.add_argument("--out_npz", type=str, default="./geoms_stats.npz",
                         help="输出统计量NPZ文件路径 (例如: geoms_stats.npz)")
+    parser.add_argument("--geom_dim", type=int, default=None,
+                        help="期望的几何特征维度（用于验证）")
     args = parser.parse_args()
 
-    print(f"正在加载数据: {args.train_npz}")
-    data = np.load(args.train_npz)
+    # 支持两种输入模式
+    if args.train_npz:
+        print(f"正在加载数据: {args.train_npz}")
+        data = np.load(args.train_npz, allow_pickle=True)
+    elif args.npz_dir:
+        import glob
+        npz_files = glob.glob(f"{args.npz_dir}/**/*.npz", recursive=True)
+        if not npz_files:
+            print(f"❌ 未在 {args.npz_dir} 中找到NPZ文件")
+            return
+        print(f"找到 {len(npz_files)} 个NPZ文件，使用第一个: {npz_files[0]}")
+        data = np.load(npz_files[0], allow_pickle=True)
+    else:
+        print("❌ 请指定 --train_npz 或 --npz_dir")
+        return
+    
     geoms = data['geoms']           # (M, K, D)
     num_tokens = data['num_tokens'] # (M,)
     
     M, K, D = geoms.shape
     print(f"找到 {M} 个样本, K_max={K}, geom_dim={D}")
+    
+    # 验证维度（如果指定）
+    if args.geom_dim is not None and D != args.geom_dim:
+        print(f"⚠️  警告: 期望维度={args.geom_dim}, 实际维度={D}")
 
     # 创建mask选择有效token（非padding）
     token_indices = np.arange(K)

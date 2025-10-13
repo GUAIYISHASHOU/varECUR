@@ -391,6 +391,10 @@ def main():
                     help="Minimum time interval (seconds) between keyframes")
     kf.add_argument("--emit_non_kf_ratio", type=float, default=0.2,
                     help="Ratio of non-keyframe pairs to emit (for diversity)")
+    kf.add_argument("--obs_min_parallax_px", type=float, default=3.0,
+                    help="Minimum pixel parallax for observation pairs (pair_type=0); discard if below")
+    kf.add_argument("--kf_only", action="store_true",
+                    help="Only emit keyframe pairs (type=1), skip observation pairs")
     
     args = ap.parse_args()
 
@@ -480,29 +484,36 @@ def main():
                     last_emit_ts = ts0_s[j]
                 elif dt_kf > args.kf_max_interval_s:
                     # 超过最大时间间隔 -> 强制作为观测帧
-                    pairs_to_process.append((last_kf, j, 0, para))  # pair_type=0表示观测帧
-                    last_emit_ts = ts0_s[j]
+                    # ✅ 仅保留"视差>=阈值"的观测对（除非启用 kf_only）
+                    if not args.kf_only and para >= args.obs_min_parallax_px:
+                        pairs_to_process.append((last_kf, j, 0, para))  # pair_type=0表示观测帧
+                        last_emit_ts = ts0_s[j]
             
             # 添加一些非关键帧对以增加多样性
             num_kf = sum(1 for _, _, pt, _ in pairs_to_process if pt == 1)
             extra = int(num_kf * args.emit_non_kf_ratio)
-            import random
-            random.seed(42)
-            cand = list(range(0, n - 5, 5))
-            random.shuffle(cand)
             
-            for idx in cand[:extra]:
-                if idx + 1 >= n:
-                    continue
-                pts0, des0, _ = orb_cache[idx]
-                pts1, des1, _ = orb_cache[idx + 1]
-                if des0 is None or des1 is None:
-                    continue
-                m = match_bf(des0, des1)
-                if len(m) < args.min_matches:
-                    continue
-                para = median_pixel_parallax(pts0[m[:, 0]], pts1[m[:, 1]])
-                pairs_to_process.append((idx, idx + 1, 0, para))
+            # ✅ 仅在非 kf_only 模式下注入邻帧对
+            if extra > 0 and not args.kf_only:
+                import random
+                random.seed(42)
+                cand = list(range(0, n - 5, 5))
+                random.shuffle(cand)
+                
+                for idx in cand[:extra]:
+                    if idx + 1 >= n:
+                        continue
+                    pts0, des0, _ = orb_cache[idx]
+                    pts1, des1, _ = orb_cache[idx + 1]
+                    if des0 is None or des1 is None:
+                        continue
+                    m = match_bf(des0, des1)
+                    if len(m) < args.min_matches:
+                        continue
+                    para = median_pixel_parallax(pts0[m[:, 0]], pts1[m[:, 1]])
+                    # ✅ 仅保留"视差>=阈值"的邻帧对
+                    if para >= args.obs_min_parallax_px:
+                        pairs_to_process.append((idx, idx + 1, 0, para))
             
             print(f"[{seq}] Selected {len(pairs_to_process)} pairs ({num_kf} KF, {len(pairs_to_process)-num_kf} obs)")
         else:
@@ -767,7 +778,9 @@ def main():
             'parallax_px': args.kf_parallax_px,
             'max_interval_s': args.kf_max_interval_s,
             'min_interval_s': args.kf_min_interval_s,
-            'emit_non_kf_ratio': args.emit_non_kf_ratio
+            'emit_non_kf_ratio': args.emit_non_kf_ratio,
+            'obs_min_parallax_px': args.obs_min_parallax_px,
+            'kf_only': args.kf_only
         } if args.kf_enable else None,
         'pipeline': 'macro_frame_v4_geoms24_kf',  # 更新版本号
     }

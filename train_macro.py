@@ -14,12 +14,18 @@ def set_seed(s=42):
     random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
 
 def spearman_torch(x, y):
+    """
+    正确的 Spearman 相关系数实现 (PyTorch 版本)
+    先中心化，再用中心化后的值计算归一化系数
+    """
     # x,y: (N,) torch
-    x_rank = torch.argsort(torch.argsort(x))
-    y_rank = torch.argsort(torch.argsort(y))
-    xr = (x_rank.float() - x_rank.float().mean()) / (x_rank.numel()**0.5)
-    yr = (y_rank.float() - y_rank.float().mean()) / (y_rank.numel()**0.5)
-    return (xr * yr).sum() / (xr.square().sum().sqrt() * yr.square().sum().sqrt() + 1e-12)
+    rx = torch.argsort(torch.argsort(x)).float()
+    ry = torch.argsort(torch.argsort(y)).float()
+    rx -= rx.mean()  # 先中心化
+    ry -= ry.mean()  # 先中心化
+    # 用中心化后的值计算归一化系数
+    denom = (rx.square().sum().sqrt() * ry.square().sum().sqrt()) + 1e-12
+    return (rx * ry).sum() / denom
 
 def count_trainable_params(model):
     """统计可训练参数数量"""
@@ -53,6 +59,10 @@ def main():
     p.add_argument("--stage1_epochs", type=int, default=0, help="Epochs for stage 1 (q-only training)")
     p.add_argument("--nll_weight",    type=float, default=1.0, help="Weight for NLL loss")
     p.add_argument("--bce_weight",    type=float, default=1.0, help="Weight for BCE loss")
+    p.add_argument("--rank_weight",   type=float, default=0.0, help="Weight for pairwise ranking loss")
+    p.add_argument("--rank_margin",   type=float, default=0.0, help="Margin for ranking loss")
+    # === 早停参数 ===
+    p.add_argument("--patience",      type=int, default=0, help="Early stopping patience (0=disabled)")
     args = p.parse_args()
 
     set_seed(args.seed)
@@ -74,10 +84,24 @@ def main():
     opt = torch.optim.AdamW(mdl.parameters(), lr=args.lr, weight_decay=args.wd)
     sch = CosineAnnealingLR(opt, T_max=args.epochs)
 
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=4, pin_memory=True)
-    val_dl   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    # Windows兼容：使用num_workers=0避免多进程序列化问题
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0, pin_memory=True)
+    val_dl   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+
+    # === 新增：计算训练集内点率，用于BCE的pos_weight（类别平衡）===
+    train_inlier_rate = float(train_ds.y_inlier.mean())
+    print(f"\n训练集内点率: {train_inlier_rate*100:.1f}%")
+    if train_inlier_rate > 0 and train_inlier_rate < 1.0:
+        # pos_weight = (1-p) / p，给正样本（内点）更高权重以平衡类别
+        pos_weight_value = (1.0 - train_inlier_rate) / max(train_inlier_rate, 1e-6)
+        pos_weight = torch.tensor([pos_weight_value], device=args.device)
+        print(f"BCE pos_weight: {pos_weight_value:.3f} (平衡类别不平衡)\n")
+    else:
+        pos_weight = None
+        print("内点率为0或1，不使用pos_weight\n")
 
     best_spear = -1.0
+    patience_counter = 0  # 早停计数器
     for ep in range(1, args.epochs+1):
         mdl.train()
         lossv = []
@@ -107,7 +131,10 @@ def main():
         crit = CombinedUncertaintyLoss(
             nll_weight=args.nll_weight, 
             bce_weight=args.bce_weight,
-            stage1_mode=is_stage1
+            rank_weight=args.rank_weight,
+            rank_margin=args.rank_margin,
+            stage1_mode=is_stage1,
+            pos_weight=pos_weight  # 类别平衡权重
         )
         
         for b in train_dl:
@@ -166,9 +193,10 @@ def main():
         mean_loss = sum(lossv)/max(1,len(lossv))
         print(f"[ep {ep:03d}] train_loss={mean_loss:.4f}  spear_mean={sp_m:.3f}  q_acc={accuracy:.3f}")
         
-        # ----- 保存 -----
+        # ----- 保存 & 早停检查 -----
         if sp_m > best_spear:
             best_spear = sp_m
+            patience_counter = 0  # 重置计数器
             ckpt = {
                 "model": mdl.state_dict(),
                 "args": vars(args),
@@ -177,6 +205,16 @@ def main():
             }
             torch.save(ckpt, Path(args.save_dir)/"best_macro_sa.pt")
             print(f"  ↳ saved best (mean spear={sp_m:.3f}, q_acc={accuracy:.3f})")
+        else:
+            patience_counter += 1
+            if args.patience > 0:
+                print(f"  ↳ no improvement ({patience_counter}/{args.patience})")
+        
+        # 早停触发
+        if args.patience > 0 and patience_counter >= args.patience:
+            print(f"\n[Early Stop] No improvement for {args.patience} epochs. Best spear={best_spear:.3f}")
+            print(f"[Early Stop] Stopped at epoch {ep}/{args.epochs}")
+            break
 
 if __name__ == "__main__":
     main()

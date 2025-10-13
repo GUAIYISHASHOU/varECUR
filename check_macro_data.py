@@ -18,22 +18,43 @@ def check(npz_path):
     
     if meta:
         print(f"\n[Meta 信息]")
-        print(f"  Pipeline:       {meta.get('pipeline', 'N/A')}")
-        print(f"  Sequences:      {', '.join(meta.get('seqs', []))}")
-        print(f"  Deltas:         {meta.get('deltas', 'N/A')}")
-        print(f"  Patch:          {meta.get('patch', 'N/A')}x{meta.get('patch', 'N/A')}")
-        print(f"  K_tokens:       {meta.get('K_tokens', 'N/A')}")
-        print(f"  Frame step:     {meta.get('frame_step', 'N/A')}")
-        print(f"  Min matches:    {meta.get('min_matches', 'N/A')}")
-        print(f"  Pos thr (base): {meta.get('pos_thr_px', 'N/A')} px")
-        print(f"    V1 upper:     {meta.get('pos_thr_px_v1', 'N/A')} px")
-        print(f"    V2 upper:     {meta.get('pos_thr_px_v2', 'N/A')} px")
-        print(f"    MH lower:     {meta.get('pos_thr_px_mh', 'N/A')} px")
-        print(f"  Err clip:       {meta.get('err_clip_px', 'N/A')} px")
-        print(f"  Geom dim:       {meta.get('geom_dim', 'N/A')}")
-        print(f"  Y format:       {meta.get('y_format', 'N/A')}")
+        
+        # 判断是新格式还是旧格式
+        if 'global_params' in meta:
+            # 新格式（v4_unified）
+            gp = meta.get('global_params', {})
+            print(f"  Script版本:     {meta.get('script_version', 'N/A')}")
+            print(f"  生成时间:       {meta.get('generated_time', 'N/A')}")
+            print(f"  序列:           {', '.join(meta.get('sequences', []))}")
+            print(f"  Patch:          {gp.get('patch', 'N/A')}x{gp.get('patch', 'N/A')}")
+            print(f"  K_tokens:       {gp.get('K_tokens', 'N/A')}")
+            print(f"  Min matches:    {gp.get('min_matches', 'N/A')}")
+            print(f"  KF模式:         {'启用' if gp.get('kf_enable') else '禁用'}")
+            if gp.get('kf_enable'):
+                print(f"    KF parallax:  {gp.get('kf_parallax_px', 'N/A')} px")
+                print(f"    KF max_dt:    {gp.get('kf_max_interval_s', 'N/A')} s")
+                print(f"    Emit ratio:   {gp.get('emit_non_kf_ratio', 'N/A')}")
+            print(f"  Pos thr:        V1={gp.get('pos_thr_px_v1', 'N/A')}, V2={gp.get('pos_thr_px_v2', 'N/A')}, MH={gp.get('pos_thr_px_mh', 'N/A')} px")
+            print(f"  Err clip:       {gp.get('err_clip_px', 'N/A')} px")
+            print(f"  Inlier thr:     {gp.get('inlier_thr_px', 'N/A')} px")
+        else:
+            # 旧格式
+            print(f"  Pipeline:       {meta.get('pipeline', 'N/A')}")
+            print(f"  Sequences:      {', '.join(meta.get('seqs', []))}")
+            print(f"  Deltas:         {meta.get('deltas', 'N/A')}")
+            print(f"  Patch:          {meta.get('patch', 'N/A')}x{meta.get('patch', 'N/A')}")
+            print(f"  K_tokens:       {meta.get('K_tokens', 'N/A')}")
+            print(f"  Frame step:     {meta.get('frame_step', 'N/A')}")
+            print(f"  Min matches:    {meta.get('min_matches', 'N/A')}")
+            print(f"  Pos thr (base): {meta.get('pos_thr_px', 'N/A')} px")
+            print(f"    V1 upper:     {meta.get('pos_thr_px_v1', 'N/A')} px")
+            print(f"    V2 upper:     {meta.get('pos_thr_px_v2', 'N/A')} px")
+            print(f"    MH lower:     {meta.get('pos_thr_px_mh', 'N/A')} px")
+            print(f"  Err clip:       {meta.get('err_clip_px', 'N/A')} px")
+            print(f"  Geom dim:       {meta.get('geom_dim', 'N/A')}")
+            print(f"  Y format:       {meta.get('y_format', 'N/A')}")
     else:
-        print(f"\n⚠️  [WARN] No metadata found! (旧版本数据)")
+        print(f"\n⚠️  [WARN] No metadata found!")
     
     # 数据形状
     patches = data["patches"]

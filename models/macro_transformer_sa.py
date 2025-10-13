@@ -31,15 +31,49 @@ class StudentTLoss(nn.Module):
 # ==================== 新增：统一的损失函数 ====================
 class CombinedUncertaintyLoss(nn.Module):
     """
-    结合异方差NLL损失和内点概率BCE损失。
+    结合异方差NLL损失和内点概率BCE损失，支持排序一致性损失。
     """
-    def __init__(self, nll_weight=1.0, bce_weight=1.0, stage1_mode=False):
+    def __init__(self, nll_weight=1.0, bce_weight=1.0, rank_weight=0.0, 
+                 rank_margin=0.0, stage1_mode=False, pos_weight=None):
         super().__init__()
         self.nll_weight = nll_weight
         self.bce_weight = bce_weight
+        self.rank_weight = rank_weight  # 排序损失权重
+        self.rank_margin = rank_margin  # 排序边界
         # 使用BCEWithLogitsLoss以获得更好的数值稳定性
-        self.bce_loss = nn.BCEWithLogitsLoss()
+        # pos_weight: 给正样本(inlier=1)的权重，用于处理类别不平衡
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         self.stage1_mode = stage1_mode  # 用于两阶段训练
+
+    def _pairwise_rank_loss(self, pred, target, margin=0.0):
+        """
+        批内两两排序损失（Pairwise Ranking Loss）
+        让预测值的相对大小关系与真实值一致
+        
+        Args:
+            pred: (B,) 预测的标量值
+            target: (B,) 真实的标量值
+            margin: 排序边界（可选）
+        Returns:
+            标量损失值
+        """
+        # 构造 GT 排序关系 (i 应该比 j 大/小/相等)
+        with torch.no_grad():
+            order = target[:, None] - target[None, :]  # (B, B), >0 表示 i 的GT应高于 j
+            sign = torch.sign(order)  # +1/-1/0
+        
+        # 预测值的差异
+        diff = pred[:, None] - pred[None, :]  # (B, B)
+        
+        # Logistic ranking loss: log(1 + exp(-(pred_i - pred_j) * sign))
+        # 只对有序对 (sign != 0) 计算损失
+        loss = torch.log1p(torch.exp(-(diff - margin * sign) * sign))
+        
+        # 去掉对角线和无序对
+        mask = (sign != 0).float()
+        n_pairs = mask.sum() + 1e-6
+        
+        return (loss * mask).sum() / n_pairs
 
     def forward(self, pred_logvar, pred_q_logit, gt_y_true, gt_y_inlier):
         # pred_logvar: (B, 2), 模型预测的 [logσx², logσy²]
@@ -68,8 +102,16 @@ class CombinedUncertaintyLoss(nn.Module):
             # 使用SmoothL1回归logvar
             loss_nll = F.smooth_l1_loss(pred_logvar_inliers, gt_y_true_inliers)
 
+        # --- 第三部分：排序一致性损失 (可选) ---
+        loss_rank = torch.tensor(0.0, device=pred_logvar.device)
+        if self.rank_weight > 0:
+            # 使用 s = (logσx² + logσy²) / 2 作为整体不确定性度量
+            s_pred = pred_logvar.mean(dim=-1)  # (B,)
+            s_gt = gt_y_true.mean(dim=-1)      # (B,)
+            loss_rank = self._pairwise_rank_loss(s_pred, s_gt, margin=self.rank_margin)
+
         # --- 合并损失 ---
-        total_loss = self.nll_weight * loss_nll + self.bce_weight * loss_bce
+        total_loss = self.nll_weight * loss_nll + self.bce_weight * loss_bce + self.rank_weight * loss_rank
         return total_loss
 
 # --------- Patch + Geom → Token 的轻量编码器 ----------
