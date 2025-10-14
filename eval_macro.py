@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import argparse, json
+import os
 from pathlib import Path
 import numpy as np
 import torch, torch.nn.functional as F
@@ -8,6 +9,7 @@ import matplotlib.pyplot as plt
 
 from vis.datasets.macro_frames import MacroFrames
 from models.macro_transformer_sa import MacroTransformerSA
+from vis.calibration.affine import AffineCalibrator
 
 def spearman_np(x, y):
     """
@@ -33,10 +35,24 @@ def main():
     ap.add_argument("--plots_dir", type=str, default=None)
     ap.add_argument("--temp_global", type=float, default=1.0, help="可选的全局温标倍率（>1 增大方差）")
     ap.add_argument("--scan_q_threshold", action="store_true", help="扫描q阈值以找到最优Spearman")
+    # === OOF 相关参数 ===
+    ap.add_argument("--subset_idx_file", type=str, default=None,
+                   help="Optional .npy of 1D indices to select a subset for evaluation (for K-fold OOF)")
+    ap.add_argument("--dump_preds_npz", type=str, default=None,
+                   help="导出预测结果到 npz 文件（用于 OOF 聚合）")
+    ap.add_argument("--calibrator_json", type=str, default=None,
+                   help="加载 OOF 校准器并应用到预测结果")
     args = ap.parse_args()
 
-    # === 修改：传递geom_stats_path到数据集 ===
-    ds = MacroFrames(args.npz, geom_stats_path=args.geom_stats_npz)
+    # === OOF：加载子集索引 ===
+    subset_idx = None
+    if args.subset_idx_file is not None and os.path.isfile(args.subset_idx_file):
+        subset_idx = np.load(args.subset_idx_file)
+        print(f"[OOF] 加载评测子集索引: {args.subset_idx_file}")
+        print(f"[OOF] 子集大小: {len(subset_idx)}")
+
+    # === 修改：传递geom_stats_path和subset_idx到数据集 ===
+    ds = MacroFrames(args.npz, geom_stats_path=args.geom_stats_npz, subset_idx=subset_idx)
     # Windows兼容：使用num_workers=0避免多进程序列化问题
     dl = DataLoader(ds, batch_size=64, shuffle=False, num_workers=0, pin_memory=True)
 
@@ -68,7 +84,36 @@ def main():
 
     # 可选：全局温标
     pred = pred + np.log(np.array([args.temp_global, args.temp_global], dtype=np.float32))
-
+    
+    # === OOF：应用校准器 ===
+    if args.calibrator_json is not None and os.path.isfile(args.calibrator_json):
+        print(f"\n[OOF] 加载校准器: {args.calibrator_json}")
+        with open(args.calibrator_json, "r", encoding="utf-8") as f:
+            calib_data = json.load(f)
+        
+        cal_x = AffineCalibrator.from_dict(calib_data["x"])
+        cal_y = AffineCalibrator.from_dict(calib_data["y"])
+        
+        print(f"  LogVar-X: α={cal_x.alpha:.4f}, β={cal_x.beta:.4f}")
+        print(f"  LogVar-Y: α={cal_y.alpha:.4f}, β={cal_y.beta:.4f}")
+        
+        pred[:, 0] = cal_x.apply(pred[:, 0])
+        pred[:, 1] = cal_y.apply(pred[:, 1])
+        print("  ✅ 校准已应用")
+    
+    # === OOF：导出预测结果 ===
+    if args.dump_preds_npz is not None:
+        os.makedirs(os.path.dirname(args.dump_preds_npz) or ".", exist_ok=True)
+        np.savez(args.dump_preds_npz,
+                 pred_logvar_x=pred[:, 0],
+                 pred_logvar_y=pred[:, 1],
+                 gt_logvar_x=gt[:, 0],
+                 gt_logvar_y=gt[:, 1],
+                 q=pred_q.ravel(),
+                 idx=np.arange(len(pred)))
+        print(f"\n✅ 预测结果已导出到: {args.dump_preds_npz}")
+        return  # 导出后直接返回，不进行后续评测
+    
     # === 全样本spearman（参考值，可能被外点拉低）===
     sx = spearman_np(pred[:,0], gt[:,0])
     sy = spearman_np(pred[:,1], gt[:,1])
@@ -79,12 +124,16 @@ def main():
         "spearman_mean_all": 0.5*(sx+sy)
     }
     
+    # === 获取内点标签（用于评测指标计算）===
     try:
-        # 获取内点标签
         gt_inlier = []
         for b in DataLoader(ds, batch_size=64, shuffle=False, num_workers=0):
             gt_inlier.append(b["y_inlier"])
         gt_inlier = torch.cat(gt_inlier, 0).numpy().ravel()
+    except (KeyError, AttributeError):
+        gt_inlier = None
+    
+    if gt_inlier is not None:
         
         # === 1) 只在GT内点上计算（与训练口径一致）===
         mask_gt = gt_inlier > 0.5
@@ -118,10 +167,9 @@ def main():
             metrics["q_auc"] = float(q_auc)
         except ImportError:
             pass
-    except (KeyError, AttributeError):
+    else:
         # 旧数据没有y_inlier标签
         print("警告: 数据集没有y_inlier标签，无法计算内点掩码的spearman")
-        pass
     
     print(json.dumps(metrics, indent=2))
     
@@ -168,7 +216,7 @@ def main():
                 fig, ax = plt.subplots(figsize=(8, 6))
                 
                 # 绘制外点（灰色）
-                if 'gt_inlier' in locals():
+                if gt_inlier is not None:
                     mask_out = gt_inlier < 0.5
                     if mask_out.any():
                         ax.scatter(gt[mask_out, i], pred[mask_out, i], 
@@ -202,7 +250,7 @@ def main():
         
         # ========== 2. 内点概率分布（直方图）==========
         try:
-            if 'gt_inlier' in locals():
+            if gt_inlier is not None:
                 fig, ax = plt.subplots(figsize=(10, 5))
                 
                 # GT内点的q分布
@@ -229,6 +277,7 @@ def main():
         except Exception as e:
             print(f"警告: q分布图绘制失败 - {e}")
         
+        
         # ========== 3. 各向异性分析（椭圆轴比）==========
         try:
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -239,7 +288,7 @@ def main():
             
             # 左图：各向异性散点图
             ax = axes[0]
-            if 'gt_inlier' in locals():
+            if gt_inlier is not None:
                 mask_in = gt_inlier > 0.5
                 mask_out = gt_inlier < 0.5
                 if mask_out.any():

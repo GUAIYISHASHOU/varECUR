@@ -15,12 +15,33 @@ class MacroFrames(Dataset):
       y_inlier:(M,1)      uint8    # 内点标签 [0 或 1] (存储用uint8，使用时转float32)
       meta:   dict                 # 包含 geom_dim, generation_mode, geoms_desc 等元信息
     """
-    def __init__(self, npz_path: str, geom_stats_path: str = None):
+    def __init__(self, npz_path: str, geom_stats_path: str = None, subset_idx: np.ndarray = None):
+        """
+        Args:
+            npz_path: NPZ 文件路径
+            geom_stats_path: 几何特征统计量文件路径（用于归一化）
+            subset_idx: 可选的子集索引数组，用于 K-fold OOF 训练（避免数据泄露）
+        """
         z = np.load(npz_path, allow_pickle=True)
-        self.patches = z["patches"]
-        self.geoms   = z["geoms"]
-        self.y_true  = z["y_true"]
-        self.num_tok = z["num_tokens"].astype(np.int64)
+        
+        # 先加载全部数据
+        patches_full = z["patches"]
+        geoms_full   = z["geoms"]
+        y_true_full  = z["y_true"]
+        num_tok_full = z["num_tokens"].astype(np.int64)
+        
+        # 如果指定了子集索引，只保留对应样本
+        if subset_idx is not None:
+            self.patches = patches_full[subset_idx]
+            self.geoms   = geoms_full[subset_idx]
+            self.y_true  = y_true_full[subset_idx]
+            self.num_tok = num_tok_full[subset_idx]
+            print(f"[Dataset] 使用子集索引: {len(subset_idx)}/{len(patches_full)} 样本")
+        else:
+            self.patches = patches_full
+            self.geoms   = geoms_full
+            self.y_true  = y_true_full
+            self.num_tok = num_tok_full
         
         # === 读取并显示元信息 ===
         if "meta" in z:
@@ -40,7 +61,11 @@ class MacroFrames(Dataset):
         # === 加载内点标签（uint8存储，节省空间）===
         # 如果旧的npz文件没有这个键，就默认所有都是内点
         if "y_inlier" in z:
-            self.y_inlier = z["y_inlier"]  # uint8 或 float32
+            y_inlier_full = z["y_inlier"]  # uint8 或 float32
+            if subset_idx is not None:
+                self.y_inlier = y_inlier_full[subset_idx]
+            else:
+                self.y_inlier = y_inlier_full
         else:
             # 旧NPZ兜底：全部标记为内点
             self.y_inlier = np.ones((len(self.y_true), 1), dtype=np.uint8)

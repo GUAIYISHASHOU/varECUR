@@ -63,6 +63,9 @@ def main():
     p.add_argument("--rank_margin",   type=float, default=0.0, help="Margin for ranking loss")
     # === 早停参数 ===
     p.add_argument("--patience",      type=int, default=0, help="Early stopping patience (0=disabled)")
+    # === OOF 训练：子集索引文件 ===
+    p.add_argument("--subset_idx_file", type=str, default=None,
+                   help="Optional .npy of 1D indices to select a subset for training (for K-fold OOF)")
     args = p.parse_args()
 
     set_seed(args.seed)
@@ -70,8 +73,15 @@ def main():
     with open(Path(args.save_dir)/"hparams.json", "w") as f:
         json.dump(vars(args), f, indent=2)
 
-    # === 修改：传递geom_stats_path到数据集 ===
-    train_ds = MacroFrames(args.train_npz, geom_stats_path=args.geom_stats_npz)
+    # === OOF 训练：加载子集索引 ===
+    subset_idx = None
+    if args.subset_idx_file is not None and os.path.isfile(args.subset_idx_file):
+        subset_idx = np.load(args.subset_idx_file)
+        print(f"[OOF] 加载训练子集索引: {args.subset_idx_file}")
+        print(f"[OOF] 子集大小: {len(subset_idx)}")
+
+    # === 修改：传递geom_stats_path和subset_idx到数据集 ===
+    train_ds = MacroFrames(args.train_npz, geom_stats_path=args.geom_stats_npz, subset_idx=subset_idx)
     val_ds   = MacroFrames(args.val_npz, geom_stats_path=args.geom_stats_npz)
 
     geom_dim = train_ds.geoms.shape[2]
