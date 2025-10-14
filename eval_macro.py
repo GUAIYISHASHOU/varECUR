@@ -54,8 +54,10 @@ def main():
                    help="导出预测结果到 npz 文件（用于 OOF 聚合）")
     ap.add_argument("--calibrator_json", type=str, default=None,
                    help="加载 OOF 校准器并应用到预测结果")
-    ap.add_argument("--kappa", type=float, default=0.8,
-                   help="各向异性强度缩放系数 κ∈[0.6,1.0] (默认0.8)")
+    ap.add_argument("--kappa", type=float, default=1.0,
+                   help="各向异性强度缩放系数 κ∈[0.6,1.0] (默认1.0)")
+    ap.add_argument("--sa_recenter", action="store_true",
+                   help="应用 κ 后对 a 再中心到 OOF 均值（使用 JSON 里的 a_mean_*）")
     args = ap.parse_args()
 
     # === OOF：加载子集索引 ===
@@ -123,20 +125,56 @@ def main():
             # 读取参数（向后兼容：无 version 字段时当作 v1）
             mode = sa.get("mode", "std")
             alpha_s = float(sa["alpha_s"]); beta_s = float(sa["beta_s"])
-            alpha_a = float(sa["alpha_a"]); beta_a = float(sa["beta_a"])
             
             # s/a from current (已做过 x/y 仿射后的) 预测
             s_pred = 0.5 * (pred[:, 0] + pred[:, 1])
             a_pred = 0.5 * (pred[:, 0] - pred[:, 1])
             
-            # 应用校准（线性模式：std/robust 都是线性）
-            s_cal  = alpha_s * s_pred + beta_s
-            a_cal  = alpha_a * a_pred + beta_a
-            a_adj  = float(args.kappa) * a_cal
+            # s 的校准
+            s_cal = alpha_s * s_pred + beta_s
+            
+            # a 的校准：根据模式选择
+            if mode in ["std", "robust", "deming"]:
+                alpha_a = float(sa["alpha_a"]); beta_a = float(sa["beta_a"])
+                a_map = alpha_a * a_pred + beta_a
+                
+            elif mode == "by_q":
+                # 按质量分段
+                segs = sa["by_q"]
+                a_map = np.empty_like(a_pred)
+                prev_qmax = -np.inf
+                
+                for seg in segs:
+                    qmax = float(seg["q_max"])
+                    m = (pred_q.reshape(-1) > prev_qmax) & (pred_q.reshape(-1) <= qmax)
+                    aa = float(seg["alpha_a"]); bb = float(seg["beta_a"])
+                    a_map[m] = aa * a_pred[m] + bb
+                    prev_qmax = qmax
+                
+                # 兜底：大于最后一段的直接用最后一段
+                m = (pred_q.reshape(-1) > prev_qmax)
+                if m.any():
+                    aa = float(segs[-1]["alpha_a"]); bb = float(segs[-1]["beta_a"])
+                    a_map[m] = aa * a_pred[m] + bb
+            else:
+                raise ValueError(f"Unknown sa mode: {mode}")
+            
+            # κ 缩放
+            a_adj = float(args.kappa) * a_map
+            
+            # 可选：κ 后再中心（把 a 的均值校回到 OOF 的 a_mean_gt）
+            if args.sa_recenter and ("a_mean_pred" in sa) and ("a_mean_gt" in sa):
+                mu_gt = float(sa["a_mean_gt"])
+                # 让 E[κ·a_map] ≈ μ_gt
+                # 原映射使 E[a_map]=μ_gt，乘 κ 后均值→ κ·μ_gt
+                # 需要加回 (1-κ)·μ_gt
+                a_adj = a_adj + (1.0 - float(args.kappa)) * mu_gt
+            
             pred[:, 0] = s_cal + a_adj
             pred[:, 1] = s_cal - a_adj
             
-            print(f"  s/a 校准 [{mode}]: αs={alpha_s:.4f}, βs={beta_s:.4f}, αa={alpha_a:.4f}, βa={beta_a:.4f}, κ={args.kappa:.2f}")
+            recenter_str = f", recenter={args.sa_recenter}" if args.sa_recenter else ""
+            print(f"  s/a 校准 [{mode}]: αs={alpha_s:.4f}, βs={beta_s:.4f}, κ={args.kappa:.2f}{recenter_str}")
         print("  ✅ 校准已应用")
     
     # === OOF：导出预测结果 ===
@@ -147,7 +185,7 @@ def main():
                  pred_logvar_y=pred[:, 1],
                  gt_logvar_x=gt[:, 0],
                  gt_logvar_y=gt[:, 1],
-                 q=pred_q.ravel(),
+                 pred_q=pred_q.ravel(),
                  idx=np.arange(len(pred)))
         print(f"\n✅ 预测结果已导出到: {args.dump_preds_npz}")
         return  # 导出后直接返回，不进行后续评测

@@ -28,6 +28,17 @@ def robust_std(x):
     q1, q3 = np.percentile(x, [25, 75])
     return (q3 - q1) / 1.349  # 正态分布下 IQR -> sigma
 
+def deming_fit(x, y, lam=1.0):
+    """Deming 回归（TLS 的加权版本）：考虑 x 和 y 都有误差"""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    xbar, ybar = x.mean(), y.mean()
+    sx2, sy2 = np.var(x, ddof=1), np.var(y, ddof=1)
+    sxy = np.cov(x, y, ddof=1)[0,1]
+    disc = (sy2 - lam*sx2)**2 + 4*lam*sxy**2
+    slope = (sy2 - lam*sx2 + np.sqrt(disc)) / (2*sxy + 1e-12)
+    intercept = ybar - slope * xbar
+    return float(slope), float(intercept)
+
 def run_cmd(cmd):
     """运行命令并打印"""
     print("\n" + "="*80)
@@ -64,10 +75,14 @@ def main():
     ap.add_argument("--patience", type=int, default=12)
     
     # === s/a 校准参数 ===
-    ap.add_argument("--sa_mode", choices=["std", "robust"], default="robust",
-                   help="s/a 校准方式: std=标准方差比, robust=稳健估计(默认)")
+    ap.add_argument("--sa_mode", choices=["std", "robust", "deming", "by_q"], default="robust",
+                   help="s/a 校准方式: std=标准方差比, robust=稳健估计(默认), deming=Deming回归, by_q=按质量分段")
     ap.add_argument("--winsor_p", type=float, default=2.5,
-                   help="Winsorize 百分位(robust模式用, 默认2.5)")
+                   help="Winsorize 百分位(robust/by_q模式用, 默认2.5)")
+    ap.add_argument("--byq_bins", type=str, default="0.00,0.55,1.00",
+                   help="by_q 分段边界，逗号分隔 (默认: 0.00,0.55,1.00)")
+    ap.add_argument("--deming_lambda", type=float, default=1.0,
+                   help="Deming 回归的误差比 λ (默认1.0)")
     
     args = ap.parse_args()
 
@@ -82,11 +97,12 @@ def main():
     # 载入训练集真值（用于最终拟合校准）
     tr_data = np.load(args.train_npz)
     y_true  = tr_data["y_true"]  # (M,2) logvar_x, logvar_y
-    M = y_true.shape[0]
+    M = len(y_true)
     print(f"训练集样本数: {M}")
 
-    # 累积 OOF 预测容器
-    oof_pred = np.full((M, 2), np.nan, dtype=np.float32)
+    # 准备 OOF 预测容器
+    oof_pred = np.full((M, 2), np.nan, dtype=np.float32)  # [N, 2]: logvar_x, logvar_y
+    q_oof_pred = np.full(M, np.nan, dtype=np.float32)  # [N]: 内点概率 q
 
     with tempfile.TemporaryDirectory() as tdir:
         for k, f in enumerate(folds):
@@ -146,6 +162,9 @@ def main():
             ck = np.load(pred_npz)
             oof_pred[va_idx, 0] = ck["pred_logvar_x"]
             oof_pred[va_idx, 1] = ck["pred_logvar_y"]
+            # 收集 q 预测（如果存在）
+            if "pred_q" in ck:
+                q_oof_pred[va_idx] = ck["pred_q"]
             
             print(f"\n✅ Fold {k} 完成，OOF 预测已收集")
 
@@ -190,30 +209,66 @@ def main():
     
     # a: 根据模式选择方差匹配方法
     mode = args.sa_mode
+    sa_calib = {
+        "version": 2,
+        "mode": mode,
+        "alpha_s": alpha_s, 
+        "beta_s": beta_s,
+        "a_mean_pred": float(a_pred.mean()),
+        "a_mean_gt": float(a_gt.mean())
+    }
+    
     if mode == "std":
         # 标准方法：直接用标准差比
         alpha_a = float(a_gt.std() / (a_pred.std() + 1e-8))
         beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())
+        sa_calib.update({"alpha_a": alpha_a, "beta_a": beta_a})
+        print(f"  s/a calib [std]: αs={alpha_s:.4f}, βs={beta_s:.4f}, αa={alpha_a:.4f}, βa={beta_a:.4f}")
+        
     elif mode == "robust":
         # 稳健方法：先 winsorize 再用 robust_std
         p = args.winsor_p
         a_pred_w = winsorize(a_pred, p)
         a_gt_w = winsorize(a_gt, p)
         alpha_a = float(robust_std(a_gt_w) / (robust_std(a_pred_w) + 1e-8))
-        beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())  # 均值对齐用原始数据
+        beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())
+        sa_calib.update({"alpha_a": alpha_a, "beta_a": beta_a, "winsor_p": p})
+        print(f"  s/a calib [robust]: αs={alpha_s:.4f}, βs={beta_s:.4f}, αa={alpha_a:.4f}, βa={beta_a:.4f}, winsor_p={p:.1f}")
+        
+    elif mode == "deming":
+        # Deming 回归：考虑 x 和 y 都有误差
+        alpha_a, beta_a = deming_fit(a_pred, a_gt, lam=args.deming_lambda)
+        sa_calib.update({"alpha_a": alpha_a, "beta_a": beta_a, "deming_lambda": args.deming_lambda})
+        print(f"  s/a calib [deming]: αs={alpha_s:.4f}, βs={beta_s:.4f}, αa={alpha_a:.4f}, βa={beta_a:.4f}, λ={args.deming_lambda:.2f}")
+        
+    elif mode == "by_q":
+        # 按质量分段：需要 q_oof_pred
+        if np.isnan(q_oof_pred[m_xy]).all():
+            raise ValueError("by_q 模式需要 q 的 OOF 预测，但未找到 pred_q")
+        
+        edges = [float(x) for x in args.byq_bins.split(",")]
+        segs = []
+        q = q_oof_pred[m_xy]
+        
+        for left, right in zip(edges[:-1], edges[1:]):
+            mask = (q > left) & (q <= right)
+            if mask.sum() < 120:
+                print(f"  警告: 段 ({left:.2f}, {right:.2f}] 样本数 {mask.sum()} < 120，跳过")
+                continue
+            
+            ap, ag = a_pred[mask], a_gt[mask]
+            # 段内用 robust 方法
+            ap_r, ag_r = winsorize(ap, 2.5), winsorize(ag, 2.5)
+            aa = float(robust_std(ag_r) / (robust_std(ap_r) + 1e-8))
+            bb = float(ag.mean() - aa * ap.mean())
+            segs.append({"q_max": right, "alpha_a": aa, "beta_a": bb})
+            print(f"    段 ({left:.2f}, {right:.2f}]: n={mask.sum()}, αa={aa:.4f}, βa={bb:.4f}")
+        
+        sa_calib.update({"by_q": segs, "winsor_p": 2.5})
+        print(f"  s/a calib [by_q]: αs={alpha_s:.4f}, βs={beta_s:.4f}, {len(segs)} 段")
     
-    sa_calib = {
-        "version": 2,
-        "mode": mode,
-        "alpha_s": alpha_s, 
-        "beta_s": beta_s, 
-        "alpha_a": alpha_a, 
-        "beta_a": beta_a
-    }
-    if mode == "robust":
-        sa_calib["winsor_p"] = args.winsor_p
-    
-    print(f"  s/a calib [{mode}]: αs={alpha_s:.4f}, βs={beta_s:.4f}, αa={alpha_a:.4f}, βa={beta_a:.4f}")
+    else:
+        raise ValueError(f"Unknown sa_mode: {mode}")
 
     # 保存校准器（向后兼容）
     calib_path = os.path.join(args.save_root, "calibrator_oof.json")

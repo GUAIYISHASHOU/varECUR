@@ -1,56 +1,31 @@
-结论：他说得对。三步（稳健化 αₐ → 按质量分段 → Deming/TLS 斜率）都是针对你“κ=1.0 后尾巴仍偏窄、主轴斜率仍 <1”的对症改进，而且能“无侵入”接到你现有 OOF→JSON→eval 的链路里。另一个关键提醒也对：在 s/a 域做单调映射并不严格保证每轴的 Spearman 不变（因为 lvx′=αₛs+αₐa 是两变量的线性组合，秩序在边缘会有轻微交换），只是通常影响很小。
+看完你这批新版图和你仓里现有代码（project.txt 里能看到 eval_macro.py / tools/train_oof.py 的关键段），我给你一份对仓库现状贴身的改动清单。目标：把现在“主体已贴、尾部仍略窄、均值略正偏（Pred≈0.061 vs GT≈0.044）”再往前推进，并把 s/a 校准做成可插拔、可在推理期稳定复现的工程方案。
 
-下面给详细代码修改计划（一步步做，随做随可用；完全后向兼容旧 JSON）。
+下面分文件给出“搜索锚点 + 具体补丁”，你照着改即可。
 
-0) JSON 结构（向后兼容）
+1) tools/train_oof.py（生成校准器）
 
-把 calibrator_oof.json 的 "sa_calib" 扩展为可插拔的 schema（保留老字段）：
+你已经有 s/a 的线性校准（mode="std"/"robust"），默认 winsorize + robust_std 还没把尾巴完全贴上；我们把 by_q 分段 和 Deming/TLS 加进来；同时存储 OOF 均值，方便推理期在任意 κ 下自动再中心。
 
-{
-  "x": { "alpha": ..., "beta": ... },
-  "y": { "alpha": ..., "beta": ... },
-  "sa_calib": {
-    "version": 2,
-    "mode": "robust",            // "std" | "robust" | "deming" | "by_q" | "quantile"
-    "alpha_s": ..., "beta_s": ...,
-    "alpha_a": ..., "beta_a": ...,
-    "winsor_p": 2.5,             // 仅 robust 用
-    "by_q": [                    // 仅 by_q 用（两段足够）
-      {"q_max": 0.55, "alpha_a": ..., "beta_a": ...},
-      {"q_max": 1.00, "alpha_a": ..., "beta_a": ...}
-    ],
-    "quantile": {                // 仅 quantile 用（单调插值）
-      "qs":  [1,5,10,20,30,40,50,60,70,80,90,95,99],
-      "xp":  [...],              // a_pred 的分位值
-      "yp":  [...]               // a_gt   的分位值
-    }
-  }
-}
+1.1 增加命令行参数（如果还没加全）
 
+在参数区加入（搜 argparse.ArgumentParser）：
 
-没有 "sa_calib"（旧文件）或 mode 未设置时，当作 "std" 走老逻辑。
---kappa 继续保留作上线安全旋钮。
+ap.add_argument("--sa-mode", choices=["std","robust","deming","by_q"], default="robust",
+                help="s/a 校准方式")
+ap.add_argument("--winsor-p", type=float, default=2.5, help="robust 模式下 winsorize 百分位")
+ap.add_argument("--byq-bins", type=str, default="0.00,0.55,1.00", help="by_q 分段边界，闭区间右开")
+ap.add_argument("--deming-lambda", type=float, default=1.0, help="Deming/TLS 的误差比 λ")
 
-1) tools/train_oof.py 的改动
-1.1 新增 CLI
-ap.add_argument("--sa-mode", choices=["std","robust","deming","by_q","quantile"],
-                default="robust", help="s/a 校准方式")
-ap.add_argument("--winsor-p", type=float, default=2.5, help="winsorize 百分位（robust 用）")
-ap.add_argument("--byq-bins", type=str, default="0.00,0.55,1.00", help="by_q 分段（闭开区间）")
-ap.add_argument("--deming-lambda", type=float, default=1.0, help="Deming 误差比 λ")
-ap.add_argument("--quantiles", type=str, default="1,5,10,20,30,40,50,60,70,80,90,95,99",
-                help="quantile mapping 用的分位点列表")
-
-1.2 工具函数（放到文件顶部或合适位置）
+1.2 放到文件顶部的工具函数（搜“# ===== New: s/a 域幅度校准”上方或工具函数区）
 import numpy as np
 
 def winsorize(x, p=2.5):
-    lo, hi = np.percentile(x, [p, 100-p]); 
+    lo, hi = np.percentile(x, [p, 100-p])
     return np.clip(x, lo, hi)
 
 def robust_std(x):
     q1, q3 = np.percentile(x, [25, 75])
-    return (q3 - q1) / 1.349  # 正态下 IQR→σ
+    return (q3 - q1) / 1.349
 
 def deming_fit(x, y, lam=1.0):
     x, y = np.asarray(x, float), np.asarray(y, float)
@@ -62,229 +37,161 @@ def deming_fit(x, y, lam=1.0):
     intercept = ybar - slope * xbar
     return float(slope), float(intercept)
 
-def weighted_stats(x, y=None, w=None):
-    if w is None: w = np.ones_like(x)
-    w = w.astype(float); w /= (w.sum() + 1e-12)
-    mx = float((w * x).sum())
-    if y is None:
-        vx = float((w * (x - mx)**2).sum())
-        return mx, vx
-    my = float((w * y).sum())
-    cov = float((w * (x - mx) * (y - my)).sum())
-    vx  = float((w * (x - mx)**2).sum())
-    return mx, my, vx, cov
+1.3 在“s/a 域幅度校准”块里接三种模式（搜到这行：# ===== New: s/a 域幅度校准 (在轴向仿射之后) =====）
 
-1.3 在“已套用 x/y 仿射得到 px/py 之后”，计算 s/a 并按 --sa-mode 拟合
-# 先把 OOF 预测用 x/y 仿射校正
-px = cal_x.apply(oof_pred[m_xy, 0])
-py = cal_y.apply(oof_pred[m_xy, 1])
+保持你原有 std/robust 分支，补上 deming 和 by_q，并存入 OOF 统计均值，供推理期“κ 后再中心”：
 
-s_pred = 0.5 * (px + py)
-a_pred = 0.5 * (px - py)
-s_gt   = 0.5 * (y_true[m_xy, 0] + y_true[m_xy, 1])
-a_gt   = 0.5 * (y_true[m_xy, 0] - y_true[m_xy, 1])
+# ---- 现有: s 的线性仿射 ----
+alpha_s = float(np.cov(s_pred, s_gt, bias=True)[0,1] / (np.var(s_pred) + 1e-12))
+beta_s  = float(s_gt.mean() - alpha_s * s_pred.mean())
 
-# （可选）质量权重：高 q 样本更靠前；缺 q 就注释掉
-w = None
-if 'q_oof_pred' in locals():  # 若你在 OOF 聚合里同时保存了 q 预测
-    q = q_oof_pred[m_xy].reshape(-1)
-    q0, tau = 0.55, 0.08
-    w = 1.0 / (1.0 + np.exp(-(q - q0)/tau))  # soft-weight
+mode = args.sa_mode
+if mode == "std":
+    alpha_a = float(a_gt.std() / (a_pred.std() + 1e-8))
+    beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())
 
-# s 的仿射：用（加权）协方差比
-if w is None:
-    ms, mgt, vs, cs = weighted_stats(s_pred, s_gt, None)  # 用均匀权重
-else:
-    ms, mgt, vs, cs = weighted_stats(s_pred, s_gt, w)
-alpha_s = cs / (vs + 1e-12)
-beta_s  = mgt - alpha_s * ms
+elif mode == "robust":
+    p = args.winsor_p
+    a_pred_r, a_gt_r = winsorize(a_pred, p), winsorize(a_gt, p)
+    alpha_a = float(robust_std(a_gt_r) / (robust_std(a_pred_r) + 1e-8))
+    beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())
 
-mode = args.sa_mode  # "robust" 默认
-sa_calib = {"version": 2, "mode": mode, "alpha_s": float(alpha_s), "beta_s": float(beta_s)}
-
-if mode in ["std", "robust", "deming"]:
-    if mode == "std":
-        alpha_a = float(a_gt.std() / (a_pred.std() + 1e-8))
-        beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())
-    elif mode == "robust":
-        p = args.winsor_p
-        a_pred_r, a_gt_r = winsorize(a_pred, p), winsorize(a_gt, p)
-        alpha_a = float(robust_std(a_gt_r) / (robust_std(a_pred_r) + 1e-8))
-        beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())
-        sa_calib["winsor_p"] = p
-    else:  # deming
-        alpha_a, beta_a = deming_fit(a_pred, a_gt, lam=args.deming_lambda)
-        sa_calib["deming_lambda"] = float(args.deming_lambda)
-
-    sa_calib.update({"alpha_a": float(alpha_a), "beta_a": float(beta_a)})
+elif mode == "deming":
+    alpha_a, beta_a = deming_fit(a_pred, a_gt, lam=args.deming_lambda)
 
 elif mode == "by_q":
-    # 两段：可用 args.byq-bins 控制
+    # 需要 OOF 期间也汇总出 q 的 OOF 预测到 q_oof_pred
+    assert 'q_oof_pred' in locals(), "by_q 模式需要 q 的 OOF 预测"
     edges = [float(x) for x in args.byq_bins.split(",")]
-    assert edges[0] <= 0 and edges[-1] >= 1.0
-    if 'q_oof_pred' not in locals():
-        raise ValueError("by_q 模式需要 OOF 的 q 预测（q_oof_pred）")
+    segs = []
     q = q_oof_pred[m_xy].reshape(-1)
 
-    segs = []
-    prev_edge = edges[0]
-    for e in edges[1:]:
-        mask = (q > prev_edge) & (q <= e)
-        if mask.sum() < 50:   # 防止样本太少
-            prev_edge = e; continue
+    for left, right in zip(edges[:-1], edges[1:]):
+        mask = (q > left) & (q <= right)
+        if mask.sum() < 120:    # 样本太少就跳过
+            continue
         ap, ag = a_pred[mask], a_gt[mask]
+        # 段内用 'robust'（也可换 deming）
+        ap_r, ag_r = winsorize(ap, 2.5), winsorize(ag, 2.5)
+        aa = float(robust_std(ag_r) / (robust_std(ap_r) + 1e-8))
+        bb = float(ag.mean() - aa * ap.mean())
+        segs.append({"q_max": right, "alpha_a": aa, "beta_a": bb})
+else:
+    raise ValueError(f"Unknown sa-mode: {mode}")
 
-        # 段内用稳健 αₐ（也可换 deming）
-        ap_r, ag_r = winsorize(ap, args.winsor_p), winsorize(ag, args.winsor_p)
-        alpha_a = float(robust_std(ag_r) / (robust_std(ap_r) + 1e-8))
-        # 连续性处理：让边界处连续
-        # 这里先用均值对齐，eval 时再做严格连续（见下面 eval 的实现）
-        beta_a  = float(ag.mean() - alpha_a * ap.mean())
-        segs.append({"q_max": e, "alpha_a": alpha_a, "beta_a": beta_a})
-        prev_edge = e
-
-    sa_calib["by_q"] = segs
-    sa_calib["winsor_p"] = args.winsor_p
-
-elif mode == "quantile":
-    qs = [int(x) for x in args.quantiles.split(",")]
-    xp = np.percentile(a_pred, qs).astype(float).tolist()
-    yp = np.percentile(a_gt, qs).astype(float).tolist()
-    sa_calib["quantile"] = {"qs": qs, "xp": xp, "yp": yp}
-
-# 写回 JSON（和原来一样的位置）
-payload = {"x": cal_x.to_dict(), "y": cal_y.to_dict(), "sa_calib": sa_calib}
-with open(calib_path, "w", encoding="utf-8") as f:
-    json.dump(payload, f, ensure_ascii=False, indent=2)
+# ---- 写 JSON ----
+sa_calib = {
+    "version": 2,
+    "mode": mode,
+    "alpha_s": float(alpha_s), "beta_s": float(beta_s),
+    # 记录 OOF 的均值用于 κ 后再中心
+    "a_mean_pred": float(a_pred.mean()),
+    "a_mean_gt":   float(a_gt.mean())
+}
+if mode in ["std","robust","deming"]:
+    sa_calib.update({"alpha_a": float(alpha_a), "beta_a": float(beta_a)})
+elif mode == "by_q":
+    sa_calib.update({"by_q": segs, "winsor_p": 2.5})
 
 
-从易到难：先用 --sa-mode robust（默认）；若尾巴仍收缩，再试 --sa-mode by_q；还不够再试 --sa-mode deming 或最后的 --sa-mode quantile。
+注意：by_q 需要在 OOF 聚合时同时收集 q_oof_pred。你已经在 eval_macro.py 把 q 导出到 npz（pred_q），在 OOF 流程里把各 fold 的 q 也一起聚合成一条 q_oof_pred 即可（写入本文件的局部变量后就能被上面代码使用）。
 
-2) eval_macro.py 的改动
-2.1 CLI 保留 --kappa（默认 1.0）
+2) eval_macro.py（应用校准 + 诊断）
+
+你现在已经会加载 sa_calib 并做线性映射，但只覆盖“线性统一模式”，还不支持 by_q 分段。另外默认 --kappa=0.8，建议改成 1.0；并新增一个“κ 后再中心”的安全开关，解决你这批图里 a 的均值仍略正偏的问题。
+
+2.1 参数调整（搜 ap.add_argument("--kappa"）
 ap.add_argument("--kappa", type=float, default=1.0,
-                help="各向异性强度缩放 κ∈[0.6,1.0]")
-# 可选 override：强制按某模式解释 JSON（一般不需要）
-ap.add_argument("--sa-force-mode", choices=["std","robust","deming","by_q","quantile","auto"],
-                default="auto")
+                help="各向异性强度 κ ∈ [0.6,1.0]，默认1.0")
+ap.add_argument("--sa-recenter", action="store_true",
+                help="应用 κ 后对 a 再中心到 OOF 均值（使用 JSON 里的 a_mean_*）")
 
-2.2 读取 JSON 后，按 mode 应用 s/a（保证后向兼容）
-d = json.load(open(args.calibrator_json, "r", encoding="utf-8"))
-# 先做 x/y 仿射
-pred[:,0] = AffineCalibrator.from_dict(d["x"]).apply(pred[:,0])
-pred[:,1] = AffineCalibrator.from_dict(d["y"]).apply(pred[:,1])
-
-sa = d.get("sa_calib", None)
+2.2 应用 sa_calib（搜 # ===== s/a 域校准（可选 这一段，把 by_q 分支补上）
+sa = calib_data.get("sa_calib", None)
 if sa is not None:
-    mode = sa.get("mode", "std")
-    if args.sa_force_mode != "auto":
-        mode = args.sa_force_mode
+    pred_before_sa = pred.copy()
 
     s_pred = 0.5 * (pred[:,0] + pred[:,1])
     a_pred = 0.5 * (pred[:,0] - pred[:,1])
 
-    # ---- 线性（std/robust/deming）----
-    if mode in ["std", "robust", "deming"]:
-        alpha_s = float(sa["alpha_s"]); beta_s = float(sa["beta_s"])
+    mode   = sa.get("mode", "std")
+    alpha_s = float(sa["alpha_s"]); beta_s = float(sa["beta_s"])
+    s_cal  = alpha_s * s_pred + beta_s
+
+    if mode in ["std","robust","deming"]:
         alpha_a = float(sa["alpha_a"]); beta_a = float(sa["beta_a"])
-        s_cal = alpha_s * s_pred + beta_s
-        a_cal = alpha_a * a_pred + beta_a
+        a_map = alpha_a * a_pred + beta_a
 
-    # ---- 分段（by_q）----
     elif mode == "by_q":
-        segs = sa["by_q"]
-        alpha_s = float(sa["alpha_s"]); beta_s = float(sa["beta_s"])
-        s_cal = alpha_s * s_pred + beta_s
-        # 连续性处理：按预测 q 选择段，并让边界连续
-        if "q_pred" not in locals() and "q_pred" not in globals():
-            raise ValueError("by_q 模式需要预测 q（eval 期）")
-        q = q_pred.reshape(-1)
-        a_cal = np.empty_like(a_pred)
-        prev_qmax, prev_alpha, prev_beta = 0.0, segs[0]["alpha_a"], segs[0]["beta_a"]
-        offset = 0.0
-        for i,seg in enumerate(segs):
-            mask = (q > (segs[i-1]["q_max"] if i>0 else -np.inf)) & (q <= seg["q_max"])
-            alpha, beta = float(seg["alpha_a"]), float(seg["beta_a"])
-            # 让段间连续：边界处 a 映射一致
-            if i>0:
-                q_edge = segs[i-1]["q_max"]
-                # 用该段边界处的 a_pred 的均值近似一个连续条件
-                # 更严格可用真正边界样本的均值；此处简化
-                beta = beta + (prev_alpha - alpha) * a_pred[mask].mean() + (prev_beta - 0.0)
-            a_cal[mask] = alpha * a_pred[mask] + beta
-            prev_alpha, prev_beta = alpha, beta
-
-    # ---- 分位数映射（quantile）----
-    elif mode == "quantile":
-        alpha_s = float(sa["alpha_s"]); beta_s = float(sa["beta_s"])
-        s_cal = alpha_s * s_pred + beta_s
-        xp = np.array(sa["quantile"]["xp"], dtype=float)
-        yp = np.array(sa["quantile"]["yp"], dtype=float)
-        # 单调插值；外推线性
-        a_cal = np.interp(a_pred, xp, yp, left=yp[0] + (a_pred - xp[0]) * (yp[1]-yp[0])/(xp[1]-xp[0]),
-                                         right=yp[-1] + (a_pred - xp[-1]) * (yp[-1]-yp[-2])/(xp[-1]-xp[-2]))
-
+        assert 'pred_q' in locals(), "by_q 需要 eval 时也有 q 预测"
+        a_map = np.empty_like(a_pred)
+        prev_qmax = -np.inf
+        for seg in sa["by_q"]:
+            qmax = float(seg["q_max"])
+            m = (pred_q.reshape(-1) > prev_qmax) & (pred_q.reshape(-1) <= qmax)
+            aa = float(seg["alpha_a"]); bb = float(seg["beta_a"])
+            a_map[m] = aa * a_pred[m] + bb
+            prev_qmax = qmax
+        # 兜底：大于最后一段的直接用最后一段
+        m = (pred_q.reshape(-1) > prev_qmax)
+        if m.any():
+            aa = float(sa["by_q"][-1]["alpha_a"]); bb = float(sa["by_q"][-1]["beta_a"])
+            a_map[m] = aa * a_pred[m] + bb
     else:
         raise ValueError(f"Unknown sa mode: {mode}")
 
-    a_adj = args.kappa * a_cal
+    # κ 缩放
+    a_adj = float(args.kappa) * a_map
+
+    # 可选：κ 后再中心（把 a 的均值校回到 OOF 的 a_mean_gt）
+    if args.sa_recenter and ("a_mean_pred" in sa) and ("a_mean_gt" in sa):
+        mu_pred = float(sa["a_mean_pred"])
+        mu_gt   = float(sa["a_mean_gt"])
+        # 让 E[κ(α a + β)] ≈ μ_gt  —— 使用 OOF 的均值闭式修正
+        # 原映射：a_map = α a + β，使 E[a_map]=μ_gt
+        # 乘 κ 后均值→ κ μ_gt，需要加回 (1-κ)*μ_gt
+        a_adj = a_adj + (1.0 - float(args.kappa)) * mu_gt
+
     pred[:,0] = s_cal + a_adj
     pred[:,1] = s_cal - a_adj
 
-2.3 评估时打印 3 个“诊断数值”（强烈建议保留）
-def slope_ols(x, y):
-    vx = np.var(x, ddof=1); sxy = np.cov(x, y, ddof=1)[0,1]
-    return float(sxy / (vx + 1e-12))
+    print(f"  s/a 校准 [{mode}]: αs={alpha_s:.4f}, βs={beta_s:.4f}, κ={args.kappa:.2f}, recenter={args.sa_recenter}")
 
-# 仅 inlier
-mask_in = (gt_inlier == 1) if "gt_inlier" in locals() else np.ones(len(pred), bool)
 
-a_gt   = (gt[:,0] - gt[:,1]) / 2.0
-a_pre  = (pred_before_sa[:,0] - pred_before_sa[:,1]) / 2.0 if 'pred_before_sa' in locals() and pred_before_sa is not None else None
-a_post = (pred[:,0] - pred[:,1]) / 2.0
+说明：如果 OOF 拟合时 βₐ 使得 E[αₐ·a_pred+βₐ]=μ_gt，在部署端乘上 κ 后，均值会变成 κ μ_gt。上面这行 +(1-κ)*μ_gt 就是把均值拉回 μ_gt，解决你图里 Pred 均值略高的问题（当 κ=1.0 时该项为 0，不改变现状）。
 
-if a_pre is not None:
-    print(f"[Diag] slope(a_pre ~ a_gt)  = {slope_ols(a_gt[mask_in], a_pre[mask_in]):.3f}")
-print(f"[Diag] slope(a_post ~ a_gt) = {slope_ols(a_gt[mask_in], a_post[mask_in]):.3f}")
-def rstd(x): return robust_std(x)
-print(f"[Diag] robust_std ratio post/gt = {rstd(a_post[mask_in])/ (rstd(a_gt[mask_in]) + 1e-12):.3f}")
-for p in [5,50,95]:
-    print(f"[Diag] quantile {p}%: post={np.percentile(a_post[mask_in],p):.3f}, gt={np.percentile(a_gt[mask_in],p):.3f}")
+2.3 诊断输出你已经加上了
 
-3) 落地顺序（强烈建议按这个节奏）
+[Diag] slope(a_post ~ a_gt)、robust_std ratio、分位点对齐建议保留，用于快速判定“斜率是否→1、宽度是否→1、尾部是否贴”。
 
-先启用稳健 αₐ
+3) OOF 聚合时把 q 也写出来（by_q 需要）
 
-训练端：--sa-mode robust --winsor-p 2.5
+在你的 OOF 汇总脚本里（你用的是多折合并环节），除了合并 oof_pred 和 y_true，同时合并每折的 q 预测成 q_oof_pred（同一顺序的 1D 向量），让 tools/train_oof.py 能在“s/a 域幅度校准”那段通过 locals() 直接拿到它（上面的代码已做了断言）。
 
-评测端：--kappa 1.0（默认即可）
+4) 运行建议
 
-看 slope(a_post~a_gt) 是否更接近 1、robust_std ratio 是否→1、p5/p95 是否更贴。
+先跑 robust（默认）+ κ=1.0
 
-若尾部还窄：启用按质量分段（两段即可）
+python tools/train_oof.py --sa-mode robust --winsor-p 2.5 ...
+python eval_macro.py --calibrator_json ... --kappa 1.0 --sa-recenter ...
 
-训练端：--sa-mode by_q --byq-bins 0.00,0.55,1.00
 
-评测端：确保拿得到 q_pred（评测脚本里你已经有 q），观察同上诊断数。
+观察诊断：斜率↑、robust_std_ratio→1、均值对齐后直方图峰位应与 GT 几乎重合。
 
-若斜率仍 <1：把 a 的线性改用 Deming
+若尾部仍窄 → 开 by_q 两段
 
-训练端：--sa-mode deming --deming-lambda 1.0（或据 OOF 残差估 λ）
+python tools/train_oof.py --sa-mode by_q --byq-bins 0.00,0.55,1.00 ...
+python eval_macro.py --calibrator_json ... --kappa 1.0 --sa-recenter
 
-也可“by_q + deming”：分段后每段都用 deming 拟合。
 
-还想把尾部完全“抹平”：上 quantile mapping
+若主轴斜率仍 <1 → 改 deming（或 by_q 的每段里也用 deming）
 
-训练端：--sa-mode quantile
+python tools/train_oof.py --sa-mode deming --deming-lambda 1.0 ...
 
-评测端：自动 np.interp 单调映射，通常 p1/p99 直接贴上。
+5) 为什么这几步能解决你现在看到的问题
 
-注意：非线性在极端情况下可能轻微改变每轴 Spearman（见前述“保序说明”）。
+均值略正偏：--sa-recenter 直接在部署端把 κ 带来的均值缩放校回 OOF 的目标均值，解决 Pred=0.061 vs GT=0.044 的轻偏。
 
-4) 小提示
+尾部仍略窄：robust 已经拉开主体宽度；by_q 让高质量样本段采用更“放”的斜率和截距，能把 p5/p95 再贴一截；deming 修正“自变量带噪”带来的斜率回归到 0 的偏置。
 
-Spearman 严格保序只在“对每个轴单独做单调映射”时成立（如 isotonic x/y）。s/a 映射是对两变量的组合，通常 Spearman 基本不动，但不保证严格相等。
-
---kappa 继续保留，作为发布期安全旋钮。
-
-样本量：分段拟合时每段至少 ~200 样本更稳；太少会抖。
+Spearman 几乎不变：s/a 校准是保序的大致单调过程（但对每轴不是严格单变量），分布会明显改善而秩序指标变化很小，这是符合你当前“阈值扫描曲线形状变化不大”的观察。
