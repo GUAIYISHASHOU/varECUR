@@ -11,6 +11,18 @@ from vis.datasets.macro_frames import MacroFrames
 from models.macro_transformer_sa import MacroTransformerSA
 from vis.calibration.affine import AffineCalibrator
 
+# ===== 新增：诊断工具函数 =====
+def robust_std(x):
+    """稳健标准差估计：基于IQR"""
+    q1, q3 = np.percentile(x, [25, 75])
+    return (q3 - q1) / 1.349
+
+def slope_ols(x, y):
+    """OLS斜率估计"""
+    vx = np.var(x, ddof=1)
+    sxy = np.cov(x, y, ddof=1)[0,1]
+    return float(sxy / (vx + 1e-12))
+
 def spearman_np(x, y):
     """
     正确的 Spearman 相关系数实现
@@ -42,6 +54,8 @@ def main():
                    help="导出预测结果到 npz 文件（用于 OOF 聚合）")
     ap.add_argument("--calibrator_json", type=str, default=None,
                    help="加载 OOF 校准器并应用到预测结果")
+    ap.add_argument("--kappa", type=float, default=0.8,
+                   help="各向异性强度缩放系数 κ∈[0.6,1.0] (默认0.8)")
     args = ap.parse_args()
 
     # === OOF：加载子集索引 ===
@@ -86,6 +100,7 @@ def main():
     pred = pred + np.log(np.array([args.temp_global, args.temp_global], dtype=np.float32))
     
     # === OOF：应用校准器 ===
+    pred_before_sa = None
     if args.calibrator_json is not None and os.path.isfile(args.calibrator_json):
         print(f"\n[OOF] 加载校准器: {args.calibrator_json}")
         with open(args.calibrator_json, "r", encoding="utf-8") as f:
@@ -99,6 +114,29 @@ def main():
         
         pred[:, 0] = cal_x.apply(pred[:, 0])
         pred[:, 1] = cal_y.apply(pred[:, 1])
+        
+        # ===== s/a 域校准（可选，若JSON包含 sa_calib）=====
+        sa = calib_data.get("sa_calib", None)
+        if sa is not None:
+            pred_before_sa = pred.copy()
+            
+            # 读取参数（向后兼容：无 version 字段时当作 v1）
+            mode = sa.get("mode", "std")
+            alpha_s = float(sa["alpha_s"]); beta_s = float(sa["beta_s"])
+            alpha_a = float(sa["alpha_a"]); beta_a = float(sa["beta_a"])
+            
+            # s/a from current (已做过 x/y 仿射后的) 预测
+            s_pred = 0.5 * (pred[:, 0] + pred[:, 1])
+            a_pred = 0.5 * (pred[:, 0] - pred[:, 1])
+            
+            # 应用校准（线性模式：std/robust 都是线性）
+            s_cal  = alpha_s * s_pred + beta_s
+            a_cal  = alpha_a * a_pred + beta_a
+            a_adj  = float(args.kappa) * a_cal
+            pred[:, 0] = s_cal + a_adj
+            pred[:, 1] = s_cal - a_adj
+            
+            print(f"  s/a 校准 [{mode}]: αs={alpha_s:.4f}, βs={beta_s:.4f}, αa={alpha_a:.4f}, βa={beta_a:.4f}, κ={args.kappa:.2f}")
         print("  ✅ 校准已应用")
     
     # === OOF：导出预测结果 ===
@@ -172,6 +210,27 @@ def main():
         print("警告: 数据集没有y_inlier标签，无法计算内点掩码的spearman")
     
     print(json.dumps(metrics, indent=2))
+    
+    # === 新增：诊断输出（各向异性校准质量）===
+    if gt_inlier is not None and pred_before_sa is not None:
+        print("\n" + "="*60)
+        print("各向异性校准诊断")
+        print("="*60)
+        mask_in = gt_inlier > 0.5
+        
+        a_gt = (gt[:, 0] - gt[:, 1]) / 2.0
+        a_pre = (pred_before_sa[:, 0] - pred_before_sa[:, 1]) / 2.0
+        a_post = (pred[:, 0] - pred[:, 1]) / 2.0
+        
+        print(f"[Diag] OLS slope(a_pre ~ a_gt)  = {slope_ols(a_gt[mask_in], a_pre[mask_in]):.4f}")
+        print(f"[Diag] OLS slope(a_post ~ a_gt) = {slope_ols(a_gt[mask_in], a_post[mask_in]):.4f}")
+        print(f"[Diag] Robust std ratio (post/gt) = {robust_std(a_post[mask_in]) / (robust_std(a_gt[mask_in]) + 1e-12):.4f}")
+        
+        for p in [5, 50, 95]:
+            q_post = np.percentile(a_post[mask_in], p)
+            q_gt = np.percentile(a_gt[mask_in], p)
+            print(f"[Diag] Quantile {p:2d}%: post={q_post:7.3f}, gt={q_gt:7.3f}, diff={q_post-q_gt:+7.3f}")
+        print()
     
     # === 可选：扫描q阈值找到最优Spearman ===
     if args.scan_q_threshold and 'y_inlier' in ds.__dict__ or hasattr(ds, 'y_inlier'):
@@ -329,6 +388,28 @@ def main():
         except Exception as e:
             print(f"警告: 各向异性图绘制失败 - {e}")
         
+        # ========== 3.5. 新增：各向异性分布 前/后 对比 ==========
+        try:
+            if pred_before_sa is not None:
+                fig, ax = plt.subplots(figsize=(7.5, 5))
+                aniso_gt   = (gt[:, 0] - gt[:, 1]) / 2.0
+                aniso_pre  = (pred_before_sa[:, 0] - pred_before_sa[:, 1]) / 2.0
+                aniso_post = (pred[:, 0] - pred[:, 1]) / 2.0
+                ax.hist(aniso_pre,  bins=60, alpha=0.5, label='Pred a (before s/a)', density=True)
+                ax.hist(aniso_post, bins=60, alpha=0.5, label='Pred a (after s/a)',  density=True)
+                ax.hist(aniso_gt,   bins=60, alpha=0.35, label='GT a', density=True)
+                ax.axvline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+                ax.set_xlabel("Anisotropy a", fontsize=11)
+                ax.set_ylabel("Density", fontsize=11)
+                ax.set_title("Anisotropy Distribution (Pre vs Post s/a)", fontsize=12, fontweight='bold')
+                ax.legend(fontsize=9)
+                ax.grid(True, ls="--", alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(p / "anisotropy_prepost.png", dpi=200, bbox_inches='tight')
+                plt.close()
+        except Exception as e:
+            print(f"警告: 各向异性前后对比图绘制失败 - {e}")
+        
         # ========== 4. 阈值扫描曲线（如果执行了扫描）==========
         if args.scan_q_threshold and 'gt_inlier' in locals():
             try:
@@ -429,6 +510,8 @@ def main():
         print(f"   - scatter_logvar_x.png / scatter_logvar_y.png (LogVar散点图)")
         print(f"   - q_distribution.png (内点概率分布)")
         print(f"   - anisotropy_analysis.png (各向异性分析)")
+        if pred_before_sa is not None:
+            print(f"   - anisotropy_prepost.png (各向异性前后对比)")
         if args.scan_q_threshold:
             print(f"   - threshold_scan.png (阈值扫描曲线)")
         print(f"   - residual_analysis.png (残差分布)")

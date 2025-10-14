@@ -17,6 +17,17 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from vis.calibration.affine import AffineCalibrator
 
+# ===== 新增：稳健统计工具函数 =====
+def winsorize(x, p=2.5):
+    """Winsorize: 将极端值截断到指定百分位"""
+    lo, hi = np.percentile(x, [p, 100-p])
+    return np.clip(x, lo, hi)
+
+def robust_std(x):
+    """稳健标准差估计：基于IQR（四分位距）"""
+    q1, q3 = np.percentile(x, [25, 75])
+    return (q3 - q1) / 1.349  # 正态分布下 IQR -> sigma
+
 def run_cmd(cmd):
     """运行命令并打印"""
     print("\n" + "="*80)
@@ -51,6 +62,12 @@ def main():
     ap.add_argument("--bce_weight", type=float, default=0.6)
     ap.add_argument("--rank_weight", type=float, default=0.3)
     ap.add_argument("--patience", type=int, default=12)
+    
+    # === s/a 校准参数 ===
+    ap.add_argument("--sa_mode", choices=["std", "robust"], default="robust",
+                   help="s/a 校准方式: std=标准方差比, robust=稳健估计(默认)")
+    ap.add_argument("--winsor_p", type=float, default=2.5,
+                   help="Winsorize 百分位(robust模式用, 默认2.5)")
     
     args = ap.parse_args()
 
@@ -156,11 +173,53 @@ def main():
     print(f"  LogVar-X 校准: α={cal_x.alpha:.4f}, β={cal_x.beta:.4f}")
     print(f"  LogVar-Y 校准: α={cal_y.alpha:.4f}, β={cal_y.beta:.4f}")
 
-    # 保存校准器
+    # ===== New: s/a 域幅度校准 (在轴向仿射之后) =====
+    m_xy = (~np.isnan(oof_pred[:, 0])) & (~np.isnan(oof_pred[:, 1]))
+    # 先把 OOF 预测用 x/y 仿射拉正，再在 s/a 域拟合
+    px = cal_x.apply(oof_pred[m_xy, 0])
+    py = cal_y.apply(oof_pred[m_xy, 1])
+    s_pred = 0.5 * (px + py)
+    a_pred = 0.5 * (px - py)
+    s_gt   = 0.5 * (y_true[m_xy, 0] + y_true[m_xy, 1])
+    a_gt   = 0.5 * (y_true[m_xy, 0] - y_true[m_xy, 1])
+
+    def _safe_var(x, eps=1e-12): return float(np.var(x)) + eps
+    # s: 协方差比/方差比形式的仿射（多为平移修正）
+    alpha_s = float(np.cov(s_pred, s_gt, bias=True)[0,1] / _safe_var(s_pred))
+    beta_s  = float(s_gt.mean() - alpha_s * s_pred.mean())
+    
+    # a: 根据模式选择方差匹配方法
+    mode = args.sa_mode
+    if mode == "std":
+        # 标准方法：直接用标准差比
+        alpha_a = float(a_gt.std() / (a_pred.std() + 1e-8))
+        beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())
+    elif mode == "robust":
+        # 稳健方法：先 winsorize 再用 robust_std
+        p = args.winsor_p
+        a_pred_w = winsorize(a_pred, p)
+        a_gt_w = winsorize(a_gt, p)
+        alpha_a = float(robust_std(a_gt_w) / (robust_std(a_pred_w) + 1e-8))
+        beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())  # 均值对齐用原始数据
+    
+    sa_calib = {
+        "version": 2,
+        "mode": mode,
+        "alpha_s": alpha_s, 
+        "beta_s": beta_s, 
+        "alpha_a": alpha_a, 
+        "beta_a": beta_a
+    }
+    if mode == "robust":
+        sa_calib["winsor_p"] = args.winsor_p
+    
+    print(f"  s/a calib [{mode}]: αs={alpha_s:.4f}, βs={beta_s:.4f}, αa={alpha_a:.4f}, βa={beta_a:.4f}")
+
+    # 保存校准器（向后兼容）
     calib_path = os.path.join(args.save_root, "calibrator_oof.json")
+    payload = {"x": cal_x.to_dict(), "y": cal_y.to_dict(), "sa_calib": sa_calib}
     with open(calib_path, "w", encoding="utf-8") as f:
-        json.dump({"x": cal_x.to_dict(), "y": cal_y.to_dict()}, 
-                 f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
     
     print(f"\n✅ OOF 校准器已保存到: {calib_path}")
     print(f"\n{'='*80}")

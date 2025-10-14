@@ -42,7 +42,7 @@ Write-Host "Step 2: OOF training and calibrator fitting" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "Note: This will train $K_FOLDS models, may take a while..." -ForegroundColor Yellow
 
-python tools/train_oof.py --train_npz $TRAIN_NPZ --geom_stats_npz $GEOM_STATS --kfold_json $KFOLD_JSON --save_root $SAVE_ROOT --epochs 40 --stage1_epochs 8 --batch_size 32 --lr 2e-4 --a_max 3.0 --drop_token_p 0.1 --heads 4 --layers 1 --d_model 128 --nll_weight 1.5 --bce_weight 0.6 --rank_weight 0.3 --patience 12
+python tools/train_oof.py --train_npz $TRAIN_NPZ --geom_stats_npz $GEOM_STATS --kfold_json $KFOLD_JSON --save_root $SAVE_ROOT --epochs 40 --stage1_epochs 8 --batch_size 32 --lr 2e-4 --a_max 3.0 --drop_token_p 0.1 --heads 4 --layers 1 --d_model 128 --nll_weight 1.5 --bce_weight 0.6 --rank_weight 0.3 --patience 12 --sa_mode robust --winsor_p 2.5
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Error: OOF training failed" -ForegroundColor Red
@@ -61,7 +61,7 @@ Write-Host "========================================" -ForegroundColor Cyan
 
 $BEST_CKPT = "$SAVE_ROOT/fold0/best_macro_sa.pt"
 
-python eval_macro.py --npz $VAL_NPZ --ckpt $BEST_CKPT --geom_stats_npz $GEOM_STATS --calibrator_json $CALIBRATOR_JSON --scan_q_threshold --plots_dir "$SAVE_ROOT/val_plots_oof"
+python eval_macro.py --npz $VAL_NPZ --ckpt $BEST_CKPT --geom_stats_npz $GEOM_STATS --calibrator_json $CALIBRATOR_JSON --kappa 1.0 --scan_q_threshold --plots_dir "$SAVE_ROOT/val_plots_oof"
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Error: Validation evaluation failed" -ForegroundColor Red
@@ -75,7 +75,7 @@ Write-Host "`n========================================" -ForegroundColor Cyan
 Write-Host "Step 4: Evaluate on test set (apply OOF calibration)" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
-python eval_macro.py --npz $TEST_NPZ --ckpt $BEST_CKPT --geom_stats_npz $GEOM_STATS --calibrator_json $CALIBRATOR_JSON --scan_q_threshold --plots_dir "$SAVE_ROOT/test_plots_oof"
+python eval_macro.py --npz $TEST_NPZ --ckpt $BEST_CKPT --geom_stats_npz $GEOM_STATS --calibrator_json $CALIBRATOR_JSON --kappa 1.0 --scan_q_threshold --plots_dir "$SAVE_ROOT/test_plots_oof"
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Error: Test evaluation failed" -ForegroundColor Red
