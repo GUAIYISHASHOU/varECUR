@@ -11,6 +11,7 @@ IMU 评测结果可视化（VIS 风格）
 """
 import os
 import argparse
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -92,6 +93,48 @@ def vis_plot_all(pred_logvar, gt_logvar, pred_q=None, gt_inlier=None,
                     dpi=200, bbox_inches='tight')
         plt.close()
 
+    # ===== 1b) 全局口径：Σσ² (Pred) vs Σe² (GT) 散点与 Spearman =====
+    if pred.shape[0] > 0:
+        s2_pred_sum = np.exp(pred).sum(axis=1)
+        e2_sum = np.exp(gt).sum(axis=1)
+        spear_global = spearman_np(s2_pred_sum, e2_sum)
+        metrics["spearman_global_varsum"] = float(spear_global)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.scatter(e2_sum, s2_pred_sum, s=10, alpha=0.5, c='blue')
+        lo = min(e2_sum.min(), s2_pred_sum.min())
+        hi = max(e2_sum.max(), s2_pred_sum.max())
+        ax.plot([lo, hi], [lo, hi], 'r--', alpha=0.5, linewidth=2, label='Perfect')
+        ax.set_xlabel("GT Σ e² (axes)", fontsize=12)
+        ax.set_ylabel("Pred Σ σ² (axes)", fontsize=12)
+        ax.set_title(f"Global Variance vs Error (axes)\nSpearman = {spear_global:.3f}", fontsize=14, fontweight='bold')
+        ax.grid(True, ls="--", alpha=0.3)
+        ax.legend(loc='upper left', fontsize=10)
+        ax.set_aspect('equal', adjustable='box')
+        plt.tight_layout()
+        plt.savefig(Path(out_dir) / "global_scatter_varsum.png", dpi=200, bbox_inches='tight')
+        plt.close()
+
+        # —— log-log 变体（更适合长尾分布的可视化）——
+        eps = 1e-12
+        x_ll = np.log10(np.clip(e2_sum, eps, None))
+        y_ll = np.log10(np.clip(s2_pred_sum, eps, None))
+        pearson_ll = float(np.corrcoef(x_ll, y_ll)[0, 1]) if x_ll.size > 1 else 0.0
+        metrics["pearson_global_varsum_loglog"] = pearson_ll
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.scatter(x_ll, y_ll, s=10, alpha=0.5, c='blue')
+        lo = min(x_ll.min(), y_ll.min())
+        hi = max(x_ll.max(), y_ll.max())
+        ax.plot([lo, hi], [lo, hi], 'r--', alpha=0.5, linewidth=2, label='Perfect')
+        ax.set_xlabel("GT log10(Σ e²)", fontsize=12)
+        ax.set_ylabel("Pred log10(Σ σ²)", fontsize=12)
+        ax.set_title(f"Global Variance vs Error (log-log)\nPearson = {pearson_ll:.3f} | Spearman = {spear_global:.3f}", fontsize=14, fontweight='bold')
+        ax.grid(True, ls="--", alpha=0.3)
+        ax.legend(loc='upper left', fontsize=10)
+        ax.set_aspect('equal', adjustable='box')
+        plt.tight_layout()
+        plt.savefig(Path(out_dir) / "global_scatter_varsum_loglog.png", dpi=200, bbox_inches='tight')
+        plt.close()
+
     # ===== 2) 内点概率分布（若提供了 pred_q 与 gt_inlier）=====
     if (pred_q is not None) and (gt_inlier is not None):
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -138,6 +181,24 @@ def vis_plot_all(pred_logvar, gt_logvar, pred_q=None, gt_inlier=None,
         plt.tight_layout()
         plt.savefig(Path(out_dir) / "residual_analysis.png", dpi=200, bbox_inches='tight')
         plt.close()
+
+        # 全局直方图（所有轴合并）
+        residual_all = (pred - gt).astype(np.float64).reshape(-1)
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.hist(residual_all, bins=80, alpha=0.7, color='steelblue', edgecolor='black')
+        mean_all = residual_all.mean(); std_all = residual_all.std()
+        ax.axvline(0, color='red', linestyle='--', linewidth=2, label='Zero Error')
+        ax.axvline(mean_all, color='green', linestyle='--', linewidth=2, label=f'Mean={mean_all:.3f}')
+        ax.set_xlabel("Residual (Pred - GT) over all axes", fontsize=11)
+        ax.set_ylabel("Frequency", fontsize=11)
+        ax.set_title(f"Residual Distribution - Global\nMean={mean_all:.3f}, Std={std_all:.3f}", fontsize=12, fontweight='bold')
+        ax.legend(fontsize=10)
+        ax.grid(True, ls="--", alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(Path(out_dir) / "residual_analysis_global.png", dpi=200, bbox_inches='tight')
+        plt.close()
+        metrics["residual_global_mean"] = float(mean_all)
+        metrics["residual_global_std"] = float(std_all)
 
     # ===== 4) q 阈值扫描（可选）=====
     if scan_q_threshold and (pred_q is not None) and (pred is not None) and pred.shape[0] > 0:
@@ -220,6 +281,12 @@ def vis_plot_all(pred_logvar, gt_logvar, pred_q=None, gt_inlier=None,
             plt.close()
         except Exception as e:
             print(f"警告: 各向异性图绘制失败 - {e}")
+
+    try:
+        with open(Path(out_dir) / "metrics.json", "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, ensure_ascii=False)
+    except Exception as _:
+        pass
 
 
 def _load_npz(path):
