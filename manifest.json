@@ -1,0 +1,27 @@
+[
+  {
+    "seq": "MH_01_easy",
+    "nwin_acc": 1471,
+    "nwin_gyr": 1471
+  },
+  {
+    "seq": "MH_02_easy",
+    "nwin_acc": 1215,
+    "nwin_gyr": 1215
+  },
+  {
+    "seq": "MH_03_medium",
+    "nwin_acc": 1079,
+    "nwin_gyr": 1079
+  },
+  {
+    "seq": "MH_04_difficult",
+    "nwin_acc": 811,
+    "nwin_gyr": 811
+  },
+  {
+    "seq": "MH_05_difficult",
+    "nwin_acc": 907,
+    "nwin_gyr": 907
+  }
+]

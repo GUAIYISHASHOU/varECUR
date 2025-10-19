@@ -1,0 +1,4491 @@
+# Table of Contents
+- .gitignore
+- batch_gen_macro.py
+- check_macro_data.py
+- debug_v2_03.py
+- eval_macro.py
+- fit_geom_stats.py
+- plot_training_log.py
+- README_OOF.md
+- run_oof_workflow.ps1
+- train_macro.py
+- 改进计划.txt
+- .windsurf\workflows\openspec-apply.md
+- .windsurf\workflows\openspec-archive.md
+- .windsurf\workflows\openspec-proposal.md
+- models\macro_transformer_sa.py
+- models\__init__.py
+- tools\concat_perseq_npz.py
+- tools\fit_geom_stats.py
+- tools\gen_macro_samples_euroc.py
+- tools\make_kfold_splits.py
+- tools\train_oof.py
+- tools\visualize_data_quality.py
+- vis\__init__.py
+- vis\calibration\affine.py
+- vis\calibration\__init__.py
+- vis\datasets\macro_frames.py
+- vis\datasets\__init__.py
+- vis\losses\__init__.py
+- vis\models\__init__.py
+
+## File: .gitignore
+
+- Extension: 
+- Language: unknown
+- Size: 204 bytes
+- Created: 2025-09-22 01:39:59
+- Modified: 2025-10-14 11:02:44
+
+### Code
+
+```unknown
+data_cache/
+.idea/
+runs/
+__pycache__/
+trajectory_plots/
+data_gns/
+plots_gns/
+data_vis/
+project_old.txt
+改进建议.txt
+STEP_LABELS_GUIDE.md
+project.txt
+*.pyc
+*.pyo
+*.pt
+*.npz
+命令.txt
+
+```
+
+## File: batch_gen_macro.py
+
+- Extension: .py
+- Language: python
+- Size: 14689 bytes
+- Created: 2025-10-10 00:29:20
+- Modified: 2025-10-13 19:37:17
+
+### Code
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+批量生成宏观模式数据 (Frame-level Uncertainty)
+按照新的数据集划分生成 train/val/test NPZ
+"""
+
+import os
+import sys
+import subprocess
+from pathlib import Path
+import numpy as np
+import random
+import time
+
+# 固定随机种子，保证可复现
+np.random.seed(42)
+random.seed(42)
+
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    print("提示: 安装 tqdm 可显示进度条 (pip install tqdm)\n")
+
+# 配置路径
+EUROC_ROOT = "F:/SLAMdata/euroc"
+OUT_DIR = "F:/SLAMdata/_cache/macro"
+
+# 数据集划分（优化版：更均衡的域分布）
+# 目标：让Val/Test都包含多域+多难度，提升泛化评估可靠性
+# ========== 方案A: 单域策略（MH only，最保险）==========
+# 优点: 无分布偏移、样本多(4165)、LogVar一致、训练包含difficult
+# 缺点: 不测试跨域泛化
+TRAIN_SEQS = [
+    "MH_01_easy", "MH_02_easy", "MH_04_difficult",  # 2500样本 (752+919+361)
+]
+
+VAL_SEQS = [
+    "MH_05_difficult",  # 684样本
+]
+
+TEST_SEQS = [
+    "MH_03_medium",  # 981样本（测试medium泛化）
+]
+
+# # ========== 方案B: 多域策略（接受偏移）==========
+# # 优点: 多域覆盖、泛化性强
+# # 缺点: Test偏移+170%（Test全是MH高LogVar序列）
+# TRAIN_SEQS = [
+#     "V1_01_easy", "V1_02_medium",
+#     "V2_01_easy", "V2_02_medium",
+#     "MH_01_easy", "MH_03_medium",  # 5183样本
+# ]
+# 
+# VAL_SEQS = [
+#     "V1_03_difficult", "MH_02_easy",  # 1667样本
+# ]
+# 
+# TEST_SEQS = [
+#     "MH_04_difficult", "MH_05_difficult",  # 1045样本
+# ]
+
+# 参数配置
+PARAMS = {
+    "patch": 32,
+    "K_tokens": 256,
+    "deltas": [1, 2],
+    "frame_step": 2,
+    "min_matches": 32,
+    # ===== 重投影误差阈值（筛选用于标签计算的点）=====
+    "pos_thr_px": 5.0,       # 基础值：中等宽松
+    "pos_thr_px_v1": 4.0,    # V1专用：稍严格（光照好）
+    "pos_thr_px_v2": 5.0,    # V2专用：标准
+    "pos_thr_px_mh": 6.0,    # MH专用：最宽松（纹理弱）
+    "err_clip_px": 20.0,     # 尾部裁剪：极端外点截断
+    "inlier_thr_px": 3.0,    # 内点判定：中位数误差<3.0px为内点（平衡质量与数量）
+    
+    # ========== 关键帧模式参数（IC-GVINS对齐 + 优化版）==========
+    # 推荐：如果要与 IC-GVINS 行为对齐，将 kf_enable 设为 True
+    # 关键帧模式会生成24维几何特征（20维token级 + 4维帧对级）
+    # 默认模式也生成24维特征（统一格式）
+    "kf_enable": True,             # ← 启用关键帧模式（推荐，IC-GVINS对齐）✅
+    "kf_parallax_px": 20.0,       # 关键帧视差阈值（像素，提高以获得更多大视差/强各向异性样本）
+    "kf_max_interval_s": 0.30,    # 最大时间间隔（秒，超过则强制输出）
+    "kf_min_interval_s": 0.08,    # 最小时间间隔（秒，避免过密采样）
+    "emit_non_kf_ratio": 0.20,    # 非关键帧对比例（提高以增加各向异性尾部覆盖）
+    "obs_min_parallax_px": 3.0,   # 观测对最小视差阈值（像素，过滤极小运动）
+    "kf_only": False,             # 是否只保留关键帧对（False=包含观测对）
+}
+
+# ========== 序列级参数覆盖（根据难度调整采样策略）==========
+# 针对不同序列类型使用差异化参数，以优化数据分布
+SEQ_OVERRIDES = {
+    # ========== 统一核心参数策略（优化版）==========
+    # 目标：减少Train/Val/Test分布差异，提升泛化性，增加各向异性尾部覆盖
+    # 核心统一：kf_parallax_px=20, kf_max_interval_s=0.30, min_matches=32, emit_non_kf_ratio=0.20
+    
+    # Easy序列：优化参数（增加各向异性样本）
+    "V1_01_easy":      {"emit_non_kf_ratio": 0.20, "obs_min_parallax_px": 3.0},
+    "V2_01_easy":      {"emit_non_kf_ratio": 0.20, "obs_min_parallax_px": 3.0},
+    "MH_01_easy":      {"emit_non_kf_ratio": 0.20, "obs_min_parallax_px": 3.0},
+    "MH_02_easy":      {"emit_non_kf_ratio": 0.20, "obs_min_parallax_px": 3.0},
+    
+    # Medium序列：优化参数
+    "V1_02_medium":    {"emit_non_kf_ratio": 0.20, "obs_min_parallax_px": 3.0},
+    "V2_02_medium":    {"emit_non_kf_ratio": 0.20, "obs_min_parallax_px": 3.0},
+    "MH_03_medium":    {"emit_non_kf_ratio": 0.20, "obs_min_parallax_px": 3.0},
+    
+    # Difficult序列：优化参数（统一，增加各向异性覆盖）
+    "V1_03_difficult": {"emit_non_kf_ratio": 0.20, "obs_min_parallax_px": 3.0},
+    "V2_03_difficult": {"emit_non_kf_ratio": 0.20, "obs_min_parallax_px": 3.0},
+    "MH_04_difficult": {"emit_non_kf_ratio": 0.20, "obs_min_parallax_px": 3.0},
+    "MH_05_difficult": {"emit_non_kf_ratio": 0.20, "obs_min_parallax_px": 3.0},
+}
+
+def print_header(msg, color="cyan"):
+    """打印带颜色的标题"""
+    colors = {
+        "cyan": "\033[96m",
+        "green": "\033[92m",
+        "yellow": "\033[93m",
+        "red": "\033[91m",
+        "end": "\033[0m"
+    }
+    c = colors.get(color, "")
+    end = colors["end"]
+    print(f"\n{c}{'='*50}")
+    print(msg)
+    print(f"{'='*50}{end}\n")
+
+def generate_one_sequence(seq_name, temp_npz_path):
+    """为单个序列生成数据（应用序列级参数覆盖）"""
+    # 复制全局参数
+    params = PARAMS.copy()
+    
+    # 应用序列级覆盖
+    if seq_name in SEQ_OVERRIDES:
+        params.update(SEQ_OVERRIDES[seq_name])
+        print(f"  [{seq_name}] 应用序列级参数: {SEQ_OVERRIDES[seq_name]}")
+    
+    # 构建命令
+    cmd = [
+        "python", "tools/gen_macro_samples_euroc.py",
+        "--euroc_root", EUROC_ROOT,
+        "--seqs", seq_name,
+        "--cam_id", "0",
+        "--out_npz", temp_npz_path,
+        "--patch", str(params["patch"]),
+        "--K_tokens", str(params["K_tokens"]),
+        "--min_matches", str(params["min_matches"]),
+        "--pos_thr_px", f"{params['pos_thr_px']}",
+        "--pos_thr_px_v1", f"{params['pos_thr_px_v1']}",
+        "--pos_thr_px_v2", f"{params['pos_thr_px_v2']}",
+        "--pos_thr_px_mh", f"{params['pos_thr_px_mh']}",
+        "--err_clip_px", f"{params['err_clip_px']}",
+        "--inlier_thr_px", f"{params['inlier_thr_px']}",
+    ]
+    
+    # 根据模式添加不同的参数
+    if params["kf_enable"]:
+        cmd += [
+            "--kf_enable",
+            "--kf_parallax_px", str(params["kf_parallax_px"]),
+            "--kf_max_interval_s", str(params["kf_max_interval_s"]),
+            "--kf_min_interval_s", str(params["kf_min_interval_s"]),
+            "--emit_non_kf_ratio", str(params["emit_non_kf_ratio"]),
+            "--obs_min_parallax_px", str(params["obs_min_parallax_px"]),
+        ]
+        if params.get("kf_only", False):
+            cmd += ["--kf_only"]
+    else:
+        cmd += [
+            "--deltas"] + [str(d) for d in params["deltas"]] + [
+            "--frame_step", str(params["frame_step"]),
+        ]
+    
+    # 执行命令
+    # 执行命令，捕获输出以便调试
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        print(f"\n\033[91m✗ {seq_name} 生成失败!\033[0m")
+        print("---- STDOUT ----")
+        print(res.stdout)
+        print("---- STDERR ----")
+        print(res.stderr)
+        res.check_returncode()  # 抛出异常
+    return temp_npz_path
+
+def merge_npz_files(npz_paths, output_path, sequences):
+    """合并多个npz文件，并保存完整的元数据"""
+    all_patches, all_geoms, all_ytrue, all_numtok, all_yinlier = [], [], [], [], []
+    
+    print(f"  [DEBUG] 准备合并 {len(npz_paths)} 个文件:")
+    for npz_path in npz_paths:
+        if not Path(npz_path).exists():
+            print(f"    ⚠️  文件不存在: {npz_path}")
+            continue
+        
+        with np.load(npz_path, allow_pickle=True) as data:
+            n_samples = data['patches'].shape[0]
+            print(f"    ✓ {Path(npz_path).name}: {n_samples} 样本")
+            
+            all_patches.append(data['patches'].copy())
+            all_geoms.append(data['geoms'].copy())
+            all_ytrue.append(data['y_true'].copy())
+            all_numtok.append(data['num_tokens'].copy())
+            if 'y_inlier' in data:
+                all_yinlier.append(data['y_inlier'].copy())
+    
+    # 合并数组
+    if not all_patches:
+        print(f"  ❌ 错误: 没有数据可合并!")
+        return
+    
+    merged_patches = np.concatenate(all_patches, axis=0)
+    merged_geoms = np.concatenate(all_geoms, axis=0)
+    merged_ytrue = np.concatenate(all_ytrue, axis=0)
+    merged_numtok = np.concatenate(all_numtok, axis=0)
+    
+    print(f"  [DEBUG] 合并后总样本数: {merged_patches.shape[0]}")
+    
+    # 构建完整的元数据（可追溯性++）
+    meta = {
+        "euroc_root": EUROC_ROOT,
+        "sequences": sequences,
+        "global_params": PARAMS.copy(),
+        "seq_overrides": {s: SEQ_OVERRIDES.get(s, {}) for s in sequences},
+        "generated_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "script_version": "v4_unified",
+        "sources": [str(p) for p in npz_paths],
+    }
+    
+    save_dict = {
+        'patches': merged_patches,
+        'geoms': merged_geoms,
+        'y_true': merged_ytrue,
+        'num_tokens': merged_numtok,
+        'meta': meta,
+    }
+    
+    if all_yinlier:
+        merged_yinlier = np.concatenate(all_yinlier, axis=0)
+        save_dict['y_inlier'] = merged_yinlier
+    
+    np.savez_compressed(output_path, **save_dict)
+
+def generate_macro_data(set_name, sequences, output_npz):
+    """生成宏观模式数据（支持序列级参数覆盖）"""
+    print_header(f"生成 {set_name} 集", "green")
+    print(f"序列: {', '.join(sequences)}")
+    print(f"输出: {output_npz}\n")
+    
+    # 逐序列生成临时文件
+    temp_dir = Path(OUT_DIR) / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    temp_npzs = []
+    for seq in sequences:
+        temp_npz = temp_dir / f"{seq}.npz"
+        try:
+            print(f"  正在生成 {seq}...")
+            generate_one_sequence(seq, str(temp_npz))
+            
+            # 验证生成结果
+            if Path(temp_npz).exists():
+                with np.load(temp_npz, allow_pickle=True) as data:
+                    n = data['patches'].shape[0]
+                    print(f"    ✓ 生成成功: {n} 样本")
+                temp_npzs.append(str(temp_npz))
+            else:
+                print(f"    ⚠️  文件未生成: {temp_npz}")
+        except subprocess.CalledProcessError as e:
+            print(f"\n\033[91m✗ {seq} 生成失败!\033[0m")
+            return False
+    
+    # 合并所有临时文件
+    print(f"\n  合并 {len(temp_npzs)} 个序列...")
+    merge_npz_files(temp_npzs, output_npz, sequences)
+    
+    # 清理临时文件
+    print(f"\n  清理 {len(temp_npzs)} 个临时文件...")
+    for temp_npz in temp_npzs:
+        if Path(temp_npz).exists():
+            Path(temp_npz).unlink()
+            print(f"    已删除: {Path(temp_npz).name}")
+        else:
+            print(f"    跳过(不存在): {Path(temp_npz).name}")
+    
+    print(f"\n\033[92m✓ {set_name}集生成成功!\033[0m\n")
+    
+    # 显示数据统计
+    if os.path.exists(output_npz):
+        print("\033[96m数据统计:\033[0m")
+        try:
+            with np.load(output_npz) as z:
+                print(f"  样本数: {z['patches'].shape[0]}")
+                print(f"  Patches shape: {z['patches'].shape}")
+                print(f"  Geoms shape: {z['geoms'].shape}")
+                print(f"  Y_true shape: {z['y_true'].shape}")
+            print()
+        except Exception as e:
+            print(f"  (无法读取统计信息: {e})")
+    
+    return True
+
+def main():
+    print_header("批量生成宏观模式数据 (Macro Mode)", "cyan")
+    
+    print("数据集划分:")
+    print(f"  训练集 ({len(TRAIN_SEQS)} seqs): {', '.join(TRAIN_SEQS)}")
+    print(f"  验证集 ({len(VAL_SEQS)} seqs): {', '.join(VAL_SEQS)}")
+    print(f"  测试集 ({len(TEST_SEQS)} seq ): {', '.join(TEST_SEQS)}")
+    print()
+    print("参数配置:")
+    print(f"  K_tokens: {PARAMS['K_tokens']} (每帧最多{PARAMS['K_tokens']}个点)")
+    print(f"  patch: {PARAMS['patch']}x{PARAMS['patch']}")
+    
+    if PARAMS["kf_enable"]:
+        print(f"  \033[93m模式: 关键帧选取（IC-GVINS对齐）\033[0m")
+        print(f"  kf_parallax_px: {PARAMS['kf_parallax_px']} (关键帧视差阈值)")
+        print(f"  kf_max_interval_s: {PARAMS['kf_max_interval_s']} (最大时间间隔)")
+        print(f"  kf_min_interval_s: {PARAMS['kf_min_interval_s']} (最小时间间隔)")
+        print(f"  emit_non_kf_ratio: {PARAMS['emit_non_kf_ratio']} (非关键帧对比例)")
+    else:
+        print(f"  \033[93m模式: 默认间隔帧\033[0m")
+        print(f"  deltas: {PARAMS['deltas']} (时间间隔)")
+        print(f"  frame_step: {PARAMS['frame_step']} (每隔{PARAMS['frame_step']-1}帧采样)")
+    
+    print(f"  min_matches: {PARAMS['min_matches']} (最少匹配点)")
+    print(f"  pos_thr_px: {PARAMS['pos_thr_px']} (正负样本判定阈值, 所有序列统一)")
+    print(f"  err_clip_px: {PARAMS['err_clip_px']} (尾部裁剪阈值)")
+    print(f"  inlier_thr_px: {PARAMS['inlier_thr_px']} (内点判定阈值)")
+    print()
+    
+    # 检查EuRoC数据集
+    if not os.path.exists(EUROC_ROOT):
+        print(f"\033[91m错误: 找不到EuRoC数据集: {EUROC_ROOT}\033[0m")
+        print("请修改脚本中的 EUROC_ROOT 路径")
+        sys.exit(1)
+    
+    # 创建输出目录
+    os.makedirs(OUT_DIR, exist_ok=True)
+    
+    # 定义输出文件
+    train_npz = os.path.join(OUT_DIR, "train_frame.npz")
+    val_npz = os.path.join(OUT_DIR, "val_frame.npz")
+    test_npz = os.path.join(OUT_DIR, "test_frame.npz")
+    
+    # 1. 生成训练集
+    if not generate_macro_data("训练", TRAIN_SEQS, train_npz):
+        sys.exit(1)
+    
+    # 2. 生成验证集
+    if not generate_macro_data("验证", VAL_SEQS, val_npz):
+        sys.exit(1)
+    
+    # 3. 生成测试集
+    if not generate_macro_data("测试", TEST_SEQS, test_npz):
+        sys.exit(1)
+    
+    # 完成
+    print_header("全部完成!", "green")
+    print("生成的数据文件:")
+    print(f"  训练集: {train_npz}")
+    print(f"  验证集: {val_npz}")
+    print(f"  测试集: {test_npz}")
+    print()
+    print("\033[93m下一步: 开始训练\033[0m")
+    print()
+    print(f"python train_macro.py \\")
+    print(f"  --train_npz {train_npz} \\")
+    print(f"  --val_npz {val_npz} \\")
+    print(f"  --save_dir runs/vis_macro_sa \\")
+    print(f"  --epochs 40 --batch_size 32 --lr 2e-4 \\")
+    print(f"  --a_max 3.0 --drop_token_p 0.1 \\")
+    print(f"  --heads 4 --layers 1 --d_model 128")
+    print()
+
+if __name__ == "__main__":
+    main()
+
+
+```
+
+## File: check_macro_data.py
+
+- Extension: .py
+- Language: python
+- Size: 7125 bytes
+- Created: 2025-10-10 23:43:59
+- Modified: 2025-10-13 00:17:58
+
+### Code
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""快速检查宏观模式 NPZ 数据质量"""
+import numpy as np
+import argparse
+
+def check(npz_path):
+    print("="*70)
+    print(f"检查宏观模式数据: {npz_path}")
+    print("="*70)
+    
+    data = np.load(npz_path, allow_pickle=True)
+    
+    # Meta 信息
+    meta = data.get("meta", None)
+    if meta is not None and isinstance(meta, np.ndarray):
+        meta = meta.item()
+    
+    if meta:
+        print(f"\n[Meta 信息]")
+        
+        # 判断是新格式还是旧格式
+        if 'global_params' in meta:
+            # 新格式（v4_unified）
+            gp = meta.get('global_params', {})
+            print(f"  Script版本:     {meta.get('script_version', 'N/A')}")
+            print(f"  生成时间:       {meta.get('generated_time', 'N/A')}")
+            print(f"  序列:           {', '.join(meta.get('sequences', []))}")
+            print(f"  Patch:          {gp.get('patch', 'N/A')}x{gp.get('patch', 'N/A')}")
+            print(f"  K_tokens:       {gp.get('K_tokens', 'N/A')}")
+            print(f"  Min matches:    {gp.get('min_matches', 'N/A')}")
+            print(f"  KF模式:         {'启用' if gp.get('kf_enable') else '禁用'}")
+            if gp.get('kf_enable'):
+                print(f"    KF parallax:  {gp.get('kf_parallax_px', 'N/A')} px")
+                print(f"    KF max_dt:    {gp.get('kf_max_interval_s', 'N/A')} s")
+                print(f"    Emit ratio:   {gp.get('emit_non_kf_ratio', 'N/A')}")
+            print(f"  Pos thr:        V1={gp.get('pos_thr_px_v1', 'N/A')}, V2={gp.get('pos_thr_px_v2', 'N/A')}, MH={gp.get('pos_thr_px_mh', 'N/A')} px")
+            print(f"  Err clip:       {gp.get('err_clip_px', 'N/A')} px")
+            print(f"  Inlier thr:     {gp.get('inlier_thr_px', 'N/A')} px")
+        else:
+            # 旧格式
+            print(f"  Pipeline:       {meta.get('pipeline', 'N/A')}")
+            print(f"  Sequences:      {', '.join(meta.get('seqs', []))}")
+            print(f"  Deltas:         {meta.get('deltas', 'N/A')}")
+            print(f"  Patch:          {meta.get('patch', 'N/A')}x{meta.get('patch', 'N/A')}")
+            print(f"  K_tokens:       {meta.get('K_tokens', 'N/A')}")
+            print(f"  Frame step:     {meta.get('frame_step', 'N/A')}")
+            print(f"  Min matches:    {meta.get('min_matches', 'N/A')}")
+            print(f"  Pos thr (base): {meta.get('pos_thr_px', 'N/A')} px")
+            print(f"    V1 upper:     {meta.get('pos_thr_px_v1', 'N/A')} px")
+            print(f"    V2 upper:     {meta.get('pos_thr_px_v2', 'N/A')} px")
+            print(f"    MH lower:     {meta.get('pos_thr_px_mh', 'N/A')} px")
+            print(f"  Err clip:       {meta.get('err_clip_px', 'N/A')} px")
+            print(f"  Geom dim:       {meta.get('geom_dim', 'N/A')}")
+            print(f"  Y format:       {meta.get('y_format', 'N/A')}")
+    else:
+        print(f"\n⚠️  [WARN] No metadata found!")
+    
+    # 数据形状
+    patches = data["patches"]
+    geoms = data["geoms"]
+    y_true = data["y_true"]
+    num_tokens = data["num_tokens"]
+    
+    print(f"\n[数据形状]")
+    print(f"  Samples:        {patches.shape[0]:,}")
+    print(f"  Patches shape:  {patches.shape}  (M, K, 2, H, W)")
+    print(f"  Geoms shape:    {geoms.shape}  (M, K, geom_dim)")
+    print(f"  Y_true shape:   {y_true.shape}  (M, 2)")
+    print(f"  Num tokens:     {num_tokens.shape}")
+    
+    # Y 标签统计 (log方差)
+    print(f"\n[Y 标签统计] (log方差)")
+    print(f"  LogVar X:")
+    print(f"    Mean:   {np.mean(y_true[:, 0]):.3f}")
+    print(f"    Median: {np.median(y_true[:, 0]):.3f}")
+    print(f"    Std:    {np.std(y_true[:, 0]):.3f}")
+    print(f"    Range:  [{np.min(y_true[:, 0]):.3f}, {np.max(y_true[:, 0]):.3f}]")
+    
+    print(f"  LogVar Y:")
+    print(f"    Mean:   {np.mean(y_true[:, 1]):.3f}")
+    print(f"    Median: {np.median(y_true[:, 1]):.3f}")
+    print(f"    Std:    {np.std(y_true[:, 1]):.3f}")
+    print(f"    Range:  [{np.min(y_true[:, 1]):.3f}, {np.max(y_true[:, 1]):.3f}]")
+    
+    # 转换为实际方差 (px²)
+    var_x = np.exp(y_true[:, 0])
+    var_y = np.exp(y_true[:, 1])
+    sigma_x = np.sqrt(var_x)
+    sigma_y = np.sqrt(var_y)
+    
+    print(f"\n[实际不确定度] (σ, 单位px)")
+    print(f"  Sigma X:")
+    print(f"    Mean:   {np.mean(sigma_x):.3f} px")
+    print(f"    Median: {np.median(sigma_x):.3f} px")
+    print(f"    P25:    {np.percentile(sigma_x, 25):.3f} px")
+    print(f"    P75:    {np.percentile(sigma_x, 75):.3f} px")
+    print(f"    P95:    {np.percentile(sigma_x, 95):.3f} px")
+    
+    print(f"  Sigma Y:")
+    print(f"    Mean:   {np.mean(sigma_y):.3f} px")
+    print(f"    Median: {np.median(sigma_y):.3f} px")
+    print(f"    P25:    {np.percentile(sigma_y, 25):.3f} px")
+    print(f"    P75:    {np.percentile(sigma_y, 75):.3f} px")
+    print(f"    P95:    {np.percentile(sigma_y, 95):.3f} px")
+    
+    # Token 数量统计
+    print(f"\n[Token 数量统计]")
+    print(f"  Mean tokens:    {np.mean(num_tokens):.1f}")
+    print(f"  Median:         {np.median(num_tokens):.0f}")
+    print(f"  Min:            {np.min(num_tokens)}")
+    print(f"  Max:            {np.max(num_tokens)}")
+    print(f"  K (max):        {patches.shape[1]}")
+    full_pct = np.sum(num_tokens == patches.shape[1]) / len(num_tokens) * 100
+    print(f"  Full tokens:    {full_pct:.1f}%")
+    
+    # 各向异性分析
+    aniso = y_true[:, 0] - y_true[:, 1]  # log(σx²) - log(σy²) = log(σx²/σy²)
+    print(f"\n[各向异性分析] (log(σx²/σy²))")
+    print(f"  Mean:           {np.mean(aniso):.3f}")
+    print(f"  Std:            {np.std(aniso):.3f}")
+    print(f"  Range:          [{np.min(aniso):.3f}, {np.max(aniso):.3f}]")
+    iso_pct = np.sum(np.abs(aniso) < 0.5) / len(aniso) * 100
+    print(f"  Near-isotropic: {iso_pct:.1f}% (|log ratio| < 0.5)")
+    
+    # 诊断
+    print(f"\n[诊断]")
+    if meta is None:
+        print(f"  ⚠️  无 meta 信息，建议重新生成数据")
+    
+    mean_sigma = (np.mean(sigma_x) + np.mean(sigma_y)) / 2
+    if mean_sigma < 0.5:
+        print(f"  ✓ 平均不确定度 < 0.5px - 质量极高（可能过拟合）")
+    elif mean_sigma < 1.0:
+        print(f"  ✓ 平均不确定度 < 1.0px - 质量优秀")
+    elif mean_sigma < 2.0:
+        print(f"  ✓ 平均不确定度 < 2.0px - 质量良好")
+    elif mean_sigma < 3.0:
+        print(f"  ⚠️ 平均不确定度 2-3px - 质量尚可")
+    else:
+        print(f"  ❌ 平均不确定度 > 3px - 数据质量差")
+        print(f"    -> 建议检查：pos_thr_px 是否太宽，err_clip_px 是否合理")
+    
+    if np.mean(num_tokens) < patches.shape[1] * 0.3:
+        print(f"  ⚠️ 平均token数 < K*0.3，可能 min_matches 太低")
+    
+    print("\n" + "="*70)
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--npz", required=True, help="Path to macro NPZ file")
+    args = ap.parse_args()
+    check(args.npz)
+
+
+```
+
+## File: debug_v2_03.py
+
+- Extension: .py
+- Language: python
+- Size: 917 bytes
+- Created: 2025-10-12 22:47:57
+- Modified: 2025-10-12 22:47:57
+
+### Code
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""检查V2_03为什么样本这么少"""
+import subprocess
+
+cmd = [
+    "python", "tools/gen_macro_samples_euroc.py",
+    "--euroc_root", "F:/SLAMdata/euroc",
+    "--seqs", "V2_03_difficult",
+    "--cam_id", "0",
+    "--out_npz", "F:/SLAMdata/_cache/macro/temp/debug_V2_03.npz",
+    "--patch", "32",
+    "--K_tokens", "256",
+    "--min_matches", "32",
+    "--pos_thr_px", "5.0",
+    "--pos_thr_px_v2", "5.0",
+    "--err_clip_px", "20.0",
+    "--inlier_thr_px", "3.0",
+    "--kf_enable",
+    "--kf_parallax_px", "18.0",
+    "--kf_max_interval_s", "0.30",
+    "--kf_min_interval_s", "0.08",
+    "--emit_non_kf_ratio", "0.10",
+    "--obs_min_parallax_px", "3.0",
+]
+
+print("检查V2_03_difficult生成过程...")
+print("="*70)
+
+res = subprocess.run(cmd, capture_output=True, text=True)
+print(res.stdout)
+if res.returncode != 0:
+    print("\n错误:")
+    print(res.stderr)
+
+```
+
+## File: eval_macro.py
+
+- Extension: .py
+- Language: python
+- Size: 26523 bytes
+- Created: 2025-10-09 23:52:24
+- Modified: 2025-10-14 20:17:57
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+import argparse, json
+import os
+from pathlib import Path
+import numpy as np
+import torch, torch.nn.functional as F
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+
+from vis.datasets.macro_frames import MacroFrames
+from models.macro_transformer_sa import MacroTransformerSA
+from vis.calibration.affine import AffineCalibrator
+
+# ===== 新增：诊断工具函数 =====
+def robust_std(x):
+    """稳健标准差估计：基于IQR"""
+    q1, q3 = np.percentile(x, [25, 75])
+    return (q3 - q1) / 1.349
+
+def slope_ols(x, y):
+    """OLS斜率估计"""
+    vx = np.var(x, ddof=1)
+    sxy = np.cov(x, y, ddof=1)[0,1]
+    return float(sxy / (vx + 1e-12))
+
+def spearman_np(x, y):
+    """
+    正确的 Spearman 相关系数实现
+    先中心化，再用中心化后的值计算归一化系数
+    """
+    rx = x.argsort().argsort().astype(np.float64)
+    ry = y.argsort().argsort().astype(np.float64)
+    rx -= rx.mean()  # 先中心化
+    ry -= ry.mean()  # 先中心化
+    # 用中心化后的值计算归一化系数
+    denom = np.sqrt((rx**2).sum()) * np.sqrt((ry**2).sum()) + 1e-12
+    return float((rx * ry).sum() / denom)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--npz", type=str, required=True)
+    ap.add_argument("--ckpt", type=str, required=True)
+    # === 新增：特征归一化统计量文件 ===
+    ap.add_argument("--geom_stats_npz", type=str, default=None,
+                   help="预计算的geoms统计量文件路径 (mean/std)，用于Z-score归一化")
+    ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--plots_dir", type=str, default=None)
+    ap.add_argument("--temp_global", type=float, default=1.0, help="可选的全局温标倍率（>1 增大方差）")
+    ap.add_argument("--scan_q_threshold", action="store_true", help="扫描q阈值以找到最优Spearman")
+    # === OOF 相关参数 ===
+    ap.add_argument("--subset_idx_file", type=str, default=None,
+                   help="Optional .npy of 1D indices to select a subset for evaluation (for K-fold OOF)")
+    ap.add_argument("--dump_preds_npz", type=str, default=None,
+                   help="导出预测结果到 npz 文件（用于 OOF 聚合）")
+    ap.add_argument("--calibrator_json", type=str, default=None,
+                   help="加载 OOF 校准器并应用到预测结果")
+    ap.add_argument("--kappa", type=float, default=1.0,
+                   help="各向异性强度缩放系数 κ∈[0.6,1.0] (默认1.0)")
+    ap.add_argument("--sa_recenter", action="store_true",
+                   help="应用 κ 后对 a 再中心到 OOF 均值（使用 JSON 里的 a_mean_*）")
+    args = ap.parse_args()
+
+    # === OOF：加载子集索引 ===
+    subset_idx = None
+    if args.subset_idx_file is not None and os.path.isfile(args.subset_idx_file):
+        subset_idx = np.load(args.subset_idx_file)
+        print(f"[OOF] 加载评测子集索引: {args.subset_idx_file}")
+        print(f"[OOF] 子集大小: {len(subset_idx)}")
+
+    # === 修改：传递geom_stats_path和subset_idx到数据集 ===
+    ds = MacroFrames(args.npz, geom_stats_path=args.geom_stats_npz, subset_idx=subset_idx)
+    # Windows兼容：使用num_workers=0避免多进程序列化问题
+    dl = DataLoader(ds, batch_size=64, shuffle=False, num_workers=0, pin_memory=True)
+
+    ckpt = torch.load(args.ckpt, map_location=args.device)
+    a = ckpt["args"]
+    mdl = MacroTransformerSA(
+        geom_dim=ds.geoms.shape[2],
+        d_model=a["d_model"], n_heads=a["heads"], n_layers=a["layers"],
+        a_max=a["a_max"], drop_token_p=0.0,
+        logv_min=a["logv_min"], logv_max=a["logv_max"]
+    ).to(args.device)
+    mdl.load_state_dict(ckpt["model"], strict=True)
+    mdl.eval()
+
+    pred, gt = [], []
+    pred_q = []  # 存储内点概率
+    with torch.no_grad():
+        for b in dl:
+            # === 修改：解包两个返回值 ===
+            pred_logvar, pred_q_logit = mdl(b["patches"].to(args.device),
+                                             b["geoms"].to(args.device),
+                                             b["num_tok"].to(args.device))
+            pred.append(pred_logvar.detach().cpu())
+            pred_q.append(torch.sigmoid(pred_q_logit).detach().cpu())
+            gt.append(b["y_true"])
+    pred = torch.cat(pred, 0).numpy()      # logvar
+    gt   = torch.cat(gt, 0).numpy()
+    pred_q = torch.cat(pred_q, 0).numpy()  # 内点概率
+
+    # 可选：全局温标
+    pred = pred + np.log(np.array([args.temp_global, args.temp_global], dtype=np.float32))
+    
+    # === OOF：应用校准器 ===
+    pred_before_sa = None
+    if args.calibrator_json is not None and os.path.isfile(args.calibrator_json):
+        print(f"\n[OOF] 加载校准器: {args.calibrator_json}")
+        with open(args.calibrator_json, "r", encoding="utf-8") as f:
+            calib_data = json.load(f)
+        
+        cal_x = AffineCalibrator.from_dict(calib_data["x"])
+        cal_y = AffineCalibrator.from_dict(calib_data["y"])
+        
+        print(f"  LogVar-X: α={cal_x.alpha:.4f}, β={cal_x.beta:.4f}")
+        print(f"  LogVar-Y: α={cal_y.alpha:.4f}, β={cal_y.beta:.4f}")
+        
+        pred[:, 0] = cal_x.apply(pred[:, 0])
+        pred[:, 1] = cal_y.apply(pred[:, 1])
+        
+        # ===== s/a 域校准（可选，若JSON包含 sa_calib）=====
+        sa = calib_data.get("sa_calib", None)
+        if sa is not None:
+            pred_before_sa = pred.copy()
+            
+            # 读取参数（向后兼容：无 version 字段时当作 v1）
+            mode = sa.get("mode", "std")
+            alpha_s = float(sa["alpha_s"]); beta_s = float(sa["beta_s"])
+            
+            # s/a from current (已做过 x/y 仿射后的) 预测
+            s_pred = 0.5 * (pred[:, 0] + pred[:, 1])
+            a_pred = 0.5 * (pred[:, 0] - pred[:, 1])
+            
+            # s 的校准
+            s_cal = alpha_s * s_pred + beta_s
+            
+            # a 的校准：根据模式选择
+            if mode in ["std", "robust", "deming"]:
+                alpha_a = float(sa["alpha_a"]); beta_a = float(sa["beta_a"])
+                a_map = alpha_a * a_pred + beta_a
+                
+            elif mode == "by_q":
+                # 按质量分段
+                segs = sa["by_q"]
+                a_map = np.empty_like(a_pred)
+                prev_qmax = -np.inf
+                
+                for seg in segs:
+                    qmax = float(seg["q_max"])
+                    m = (pred_q.reshape(-1) > prev_qmax) & (pred_q.reshape(-1) <= qmax)
+                    aa = float(seg["alpha_a"]); bb = float(seg["beta_a"])
+                    a_map[m] = aa * a_pred[m] + bb
+                    prev_qmax = qmax
+                
+                # 兜底：大于最后一段的直接用最后一段
+                m = (pred_q.reshape(-1) > prev_qmax)
+                if m.any():
+                    aa = float(segs[-1]["alpha_a"]); bb = float(segs[-1]["beta_a"])
+                    a_map[m] = aa * a_pred[m] + bb
+            else:
+                raise ValueError(f"Unknown sa mode: {mode}")
+            
+            # κ 缩放
+            a_adj = float(args.kappa) * a_map
+            
+            # 可选：κ 后再中心（把 a 的均值校回到 OOF 的 a_mean_gt）
+            if args.sa_recenter and ("a_mean_pred" in sa) and ("a_mean_gt" in sa):
+                mu_gt = float(sa["a_mean_gt"])
+                # 让 E[κ·a_map] ≈ μ_gt
+                # 原映射使 E[a_map]=μ_gt，乘 κ 后均值→ κ·μ_gt
+                # 需要加回 (1-κ)·μ_gt
+                a_adj = a_adj + (1.0 - float(args.kappa)) * mu_gt
+            
+            pred[:, 0] = s_cal + a_adj
+            pred[:, 1] = s_cal - a_adj
+            
+            recenter_str = f", recenter={args.sa_recenter}" if args.sa_recenter else ""
+            print(f"  s/a 校准 [{mode}]: αs={alpha_s:.4f}, βs={beta_s:.4f}, κ={args.kappa:.2f}{recenter_str}")
+        print("  ✅ 校准已应用")
+    
+    # === OOF：导出预测结果 ===
+    if args.dump_preds_npz is not None:
+        os.makedirs(os.path.dirname(args.dump_preds_npz) or ".", exist_ok=True)
+        np.savez(args.dump_preds_npz,
+                 pred_logvar_x=pred[:, 0],
+                 pred_logvar_y=pred[:, 1],
+                 gt_logvar_x=gt[:, 0],
+                 gt_logvar_y=gt[:, 1],
+                 pred_q=pred_q.ravel(),
+                 idx=np.arange(len(pred)))
+        print(f"\n✅ 预测结果已导出到: {args.dump_preds_npz}")
+        return  # 导出后直接返回，不进行后续评测
+    
+    # === 全样本spearman（参考值，可能被外点拉低）===
+    sx = spearman_np(pred[:,0], gt[:,0])
+    sy = spearman_np(pred[:,1], gt[:,1])
+    
+    metrics = {
+        "spearman_x_all": sx, 
+        "spearman_y_all": sy, 
+        "spearman_mean_all": 0.5*(sx+sy)
+    }
+    
+    # === 获取内点标签（用于评测指标计算）===
+    try:
+        gt_inlier = []
+        for b in DataLoader(ds, batch_size=64, shuffle=False, num_workers=0):
+            gt_inlier.append(b["y_inlier"])
+        gt_inlier = torch.cat(gt_inlier, 0).numpy().ravel()
+    except (KeyError, AttributeError):
+        gt_inlier = None
+    
+    if gt_inlier is not None:
+        
+        # === 1) 只在GT内点上计算（与训练口径一致）===
+        mask_gt = gt_inlier > 0.5
+        if mask_gt.any():
+            sx_in = spearman_np(pred[mask_gt, 0], gt[mask_gt, 0])
+            sy_in = spearman_np(pred[mask_gt, 1], gt[mask_gt, 1])
+            metrics["spearman_x_inlier_gt"] = float(sx_in)
+            metrics["spearman_y_inlier_gt"] = float(sy_in)
+            metrics["spearman_mean_inlier_gt"] = float(0.5*(sx_in+sy_in))
+            metrics["n_inliers_gt"] = int(mask_gt.sum())
+        
+        # === 2) 用预测的内点(q>0.5)做掩码（推理时更贴近实战）===
+        mask_q = (pred_q.ravel() > 0.5)
+        if mask_q.any():
+            sx_q = spearman_np(pred[mask_q, 0], gt[mask_q, 0])
+            sy_q = spearman_np(pred[mask_q, 1], gt[mask_q, 1])
+            metrics["spearman_x_predq"] = float(sx_q)
+            metrics["spearman_y_predq"] = float(sy_q)
+            metrics["spearman_mean_predq"] = float(0.5*(sx_q+sy_q))
+            metrics["n_inliers_pred"] = int(mask_q.sum())
+        
+        # 计算分类指标
+        q_pred_binary = (pred_q.ravel() > 0.5).astype(np.float32)
+        q_acc = (q_pred_binary == gt_inlier).mean()
+        metrics["q_accuracy"] = float(q_acc)
+        
+        # 如果可用，计算 AUC
+        try:
+            from sklearn.metrics import roc_auc_score
+            q_auc = roc_auc_score(gt_inlier, pred_q.ravel())
+            metrics["q_auc"] = float(q_auc)
+        except ImportError:
+            pass
+    else:
+        # 旧数据没有y_inlier标签
+        print("警告: 数据集没有y_inlier标签，无法计算内点掩码的spearman")
+    
+    print(json.dumps(metrics, indent=2))
+    
+    # === 新增：诊断输出（各向异性校准质量）===
+    if gt_inlier is not None and pred_before_sa is not None:
+        print("\n" + "="*60)
+        print("各向异性校准诊断")
+        print("="*60)
+        mask_in = gt_inlier > 0.5
+        
+        a_gt = (gt[:, 0] - gt[:, 1]) / 2.0
+        a_pre = (pred_before_sa[:, 0] - pred_before_sa[:, 1]) / 2.0
+        a_post = (pred[:, 0] - pred[:, 1]) / 2.0
+        
+        print(f"[Diag] OLS slope(a_pre ~ a_gt)  = {slope_ols(a_gt[mask_in], a_pre[mask_in]):.4f}")
+        print(f"[Diag] OLS slope(a_post ~ a_gt) = {slope_ols(a_gt[mask_in], a_post[mask_in]):.4f}")
+        print(f"[Diag] Robust std ratio (post/gt) = {robust_std(a_post[mask_in]) / (robust_std(a_gt[mask_in]) + 1e-12):.4f}")
+        
+        for p in [5, 50, 95]:
+            q_post = np.percentile(a_post[mask_in], p)
+            q_gt = np.percentile(a_gt[mask_in], p)
+            print(f"[Diag] Quantile {p:2d}%: post={q_post:7.3f}, gt={q_gt:7.3f}, diff={q_post-q_gt:+7.3f}")
+        print()
+    
+    # === 可选：扫描q阈值找到最优Spearman ===
+    if args.scan_q_threshold and 'y_inlier' in ds.__dict__ or hasattr(ds, 'y_inlier'):
+        print("\n" + "="*60)
+        print("扫描 q 阈值以优化 Spearman 相关系数")
+        print("="*60)
+        thresholds = np.linspace(0.3, 0.8, 11)
+        best_thr = 0.5
+        best_spear = -1.0
+        
+        print(f"{'Threshold':>10} {'n_samples':>10} {'Spear_x':>10} {'Spear_y':>10} {'Spear_mean':>12}")
+        print("-" * 60)
+        
+        for thr in thresholds:
+            mask_thr = (pred_q.ravel() > thr)
+            if mask_thr.sum() < 10:  # 至少需要10个样本
+                continue
+            
+            sx_thr = spearman_np(pred[mask_thr, 0], gt[mask_thr, 0])
+            sy_thr = spearman_np(pred[mask_thr, 1], gt[mask_thr, 1])
+            sm_thr = 0.5 * (sx_thr + sy_thr)
+            
+            print(f"{thr:>10.2f} {mask_thr.sum():>10d} {sx_thr:>10.4f} {sy_thr:>10.4f} {sm_thr:>12.4f}", end="")
+            
+            if sm_thr > best_spear:
+                best_spear = sm_thr
+                best_thr = thr
+                print("  ← Best")
+            else:
+                print()
+        
+        print("-" * 60)
+        print(f"最优阈值: q > {best_thr:.2f}, Spearman Mean = {best_spear:.4f}")
+        print()
+
+    if args.plots_dir:
+        p = Path(args.plots_dir); p.mkdir(parents=True, exist_ok=True)
+        
+        # ========== 1. LogVar 散点图（分轴，带内点标记）==========
+        try:
+            for i, axis in enumerate(["x", "y"]):
+                fig, ax = plt.subplots(figsize=(8, 6))
+                
+                # 绘制外点（灰色）
+                if gt_inlier is not None:
+                    mask_out = gt_inlier < 0.5
+                    if mask_out.any():
+                        ax.scatter(gt[mask_out, i], pred[mask_out, i], 
+                                 s=10, alpha=0.3, c='gray', label='Outlier (GT)')
+                    
+                    # 绘制内点（彩色）
+                    mask_in = gt_inlier > 0.5
+                    if mask_in.any():
+                        ax.scatter(gt[mask_in, i], pred[mask_in, i], 
+                                 s=10, alpha=0.6, c='blue', label='Inlier (GT)')
+                else:
+                    ax.scatter(gt[:, i], pred[:, i], s=10, alpha=0.5, c='blue')
+                
+                # 对角线（完美预测）
+                lims = [min(gt[:, i].min(), pred[:, i].min()), 
+                        max(gt[:, i].max(), pred[:, i].max())]
+                ax.plot(lims, lims, 'r--', alpha=0.5, linewidth=2, label='Perfect')
+                
+                ax.set_xlabel(f"GT log(σ{axis}²)", fontsize=12)
+                ax.set_ylabel(f"Pred log(σ{axis}²)", fontsize=12)
+                ax.set_title(f"LogVar Prediction - Axis {axis.upper()}\nSpearman = {metrics.get(f'spearman_{axis}_all', 0):.3f}", 
+                           fontsize=14, fontweight='bold')
+                ax.grid(True, ls="--", alpha=0.3)
+                ax.legend(loc='upper left', fontsize=10)
+                ax.set_aspect('equal', adjustable='box')
+                plt.tight_layout()
+                plt.savefig(p / f"scatter_logvar_{axis}.png", dpi=200, bbox_inches='tight')
+                plt.close()
+        except Exception as e:
+            print(f"警告: 散点图绘制失败 - {e}")
+        
+        # ========== 2. 内点概率分布（直方图）==========
+        try:
+            if gt_inlier is not None:
+                fig, ax = plt.subplots(figsize=(10, 5))
+                
+                # GT内点的q分布
+                q_inlier = pred_q[gt_inlier > 0.5].ravel()
+                # GT外点的q分布
+                q_outlier = pred_q[gt_inlier < 0.5].ravel()
+                
+                ax.hist(q_outlier, bins=50, alpha=0.6, color='red', 
+                       label=f'Outlier (n={len(q_outlier)})', density=True)
+                ax.hist(q_inlier, bins=50, alpha=0.6, color='green', 
+                       label=f'Inlier (n={len(q_inlier)})', density=True)
+                
+                ax.axvline(0.5, color='black', linestyle='--', linewidth=2, 
+                          label='Threshold=0.5')
+                ax.set_xlabel("Predicted Inlier Probability (q)", fontsize=12)
+                ax.set_ylabel("Density", fontsize=12)
+                ax.set_title(f"Inlier Probability Distribution\nAccuracy = {metrics.get('q_accuracy', 0):.3f}, AUC = {metrics.get('q_auc', 0):.3f}", 
+                           fontsize=14, fontweight='bold')
+                ax.legend(loc='upper center', fontsize=10)
+                ax.grid(True, ls="--", alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(p / "q_distribution.png", dpi=200, bbox_inches='tight')
+                plt.close()
+        except Exception as e:
+            print(f"警告: q分布图绘制失败 - {e}")
+        
+        
+        # ========== 3. 各向异性分析（椭圆轴比）==========
+        try:
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            
+            # 计算各向异性 a = (lvx - lvy) / 2
+            aniso_pred = (pred[:, 0] - pred[:, 1]) / 2.0
+            aniso_gt = (gt[:, 0] - gt[:, 1]) / 2.0
+            
+            # 左图：各向异性散点图
+            ax = axes[0]
+            if gt_inlier is not None:
+                mask_in = gt_inlier > 0.5
+                mask_out = gt_inlier < 0.5
+                if mask_out.any():
+                    ax.scatter(aniso_gt[mask_out], aniso_pred[mask_out], 
+                             s=10, alpha=0.3, c='gray', label='Outlier')
+                if mask_in.any():
+                    ax.scatter(aniso_gt[mask_in], aniso_pred[mask_in], 
+                             s=10, alpha=0.6, c='blue', label='Inlier')
+            else:
+                ax.scatter(aniso_gt, aniso_pred, s=10, alpha=0.5, c='blue')
+            
+            lims = [min(aniso_gt.min(), aniso_pred.min()), 
+                    max(aniso_gt.max(), aniso_pred.max())]
+            ax.plot(lims, lims, 'r--', alpha=0.5, linewidth=2, label='Perfect')
+            ax.set_xlabel("GT Anisotropy a = (lvx - lvy)/2", fontsize=11)
+            ax.set_ylabel("Pred Anisotropy a", fontsize=11)
+            ax.set_title("Anisotropy Prediction", fontsize=12, fontweight='bold')
+            ax.grid(True, ls="--", alpha=0.3)
+            ax.legend(fontsize=9)
+            ax.set_aspect('equal', adjustable='box')
+            
+            # 右图：各向异性分布对比
+            ax = axes[1]
+            ax.hist(aniso_gt, bins=50, alpha=0.5, color='green', 
+                   label=f'GT (mean={aniso_gt.mean():.3f})', density=True)
+            ax.hist(aniso_pred, bins=50, alpha=0.5, color='blue', 
+                   label=f'Pred (mean={aniso_pred.mean():.3f})', density=True)
+            ax.axvline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+            ax.set_xlabel("Anisotropy a", fontsize=11)
+            ax.set_ylabel("Density", fontsize=11)
+            ax.set_title("Anisotropy Distribution", fontsize=12, fontweight='bold')
+            ax.legend(fontsize=9)
+            ax.grid(True, ls="--", alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(p / "anisotropy_analysis.png", dpi=200, bbox_inches='tight')
+            plt.close()
+        except Exception as e:
+            print(f"警告: 各向异性图绘制失败 - {e}")
+        
+        # ========== 3.5. 新增：各向异性分布 前/后 对比 ==========
+        try:
+            if pred_before_sa is not None:
+                fig, ax = plt.subplots(figsize=(7.5, 5))
+                aniso_gt   = (gt[:, 0] - gt[:, 1]) / 2.0
+                aniso_pre  = (pred_before_sa[:, 0] - pred_before_sa[:, 1]) / 2.0
+                aniso_post = (pred[:, 0] - pred[:, 1]) / 2.0
+                ax.hist(aniso_pre,  bins=60, alpha=0.5, label='Pred a (before s/a)', density=True)
+                ax.hist(aniso_post, bins=60, alpha=0.5, label='Pred a (after s/a)',  density=True)
+                ax.hist(aniso_gt,   bins=60, alpha=0.35, label='GT a', density=True)
+                ax.axvline(0, color='black', linestyle='--', linewidth=1, alpha=0.5)
+                ax.set_xlabel("Anisotropy a", fontsize=11)
+                ax.set_ylabel("Density", fontsize=11)
+                ax.set_title("Anisotropy Distribution (Pre vs Post s/a)", fontsize=12, fontweight='bold')
+                ax.legend(fontsize=9)
+                ax.grid(True, ls="--", alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(p / "anisotropy_prepost.png", dpi=200, bbox_inches='tight')
+                plt.close()
+        except Exception as e:
+            print(f"警告: 各向异性前后对比图绘制失败 - {e}")
+        
+        # ========== 4. 阈值扫描曲线（如果执行了扫描）==========
+        if args.scan_q_threshold and 'gt_inlier' in locals():
+            try:
+                fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+                
+                thresholds = np.linspace(0.3, 0.8, 11)
+                spear_x_list, spear_y_list, spear_mean_list = [], [], []
+                n_samples_list = []
+                
+                for thr in thresholds:
+                    mask_thr = (pred_q.ravel() > thr)
+                    if mask_thr.sum() < 10:
+                        spear_x_list.append(np.nan)
+                        spear_y_list.append(np.nan)
+                        spear_mean_list.append(np.nan)
+                        n_samples_list.append(0)
+                        continue
+                    
+                    sx_thr = spearman_np(pred[mask_thr, 0], gt[mask_thr, 0])
+                    sy_thr = spearman_np(pred[mask_thr, 1], gt[mask_thr, 1])
+                    sm_thr = 0.5 * (sx_thr + sy_thr)
+                    
+                    spear_x_list.append(sx_thr)
+                    spear_y_list.append(sy_thr)
+                    spear_mean_list.append(sm_thr)
+                    n_samples_list.append(mask_thr.sum())
+                
+                # 左图：Spearman vs 阈值
+                ax = axes[0]
+                ax.plot(thresholds, spear_x_list, 'o-', label='Spearman X', linewidth=2, markersize=6)
+                ax.plot(thresholds, spear_y_list, 's-', label='Spearman Y', linewidth=2, markersize=6)
+                ax.plot(thresholds, spear_mean_list, '^-', label='Spearman Mean', 
+                       linewidth=2.5, markersize=7, color='red')
+                
+                # 标记最优点
+                best_idx = np.nanargmax(spear_mean_list)
+                ax.scatter(thresholds[best_idx], spear_mean_list[best_idx], 
+                          s=200, c='gold', marker='*', edgecolors='black', 
+                          linewidths=2, zorder=10, label='Best')
+                
+                ax.set_xlabel("q Threshold", fontsize=12)
+                ax.set_ylabel("Spearman Correlation", fontsize=12)
+                ax.set_title(f"Spearman vs q Threshold\nBest: q>{thresholds[best_idx]:.2f}, Spear={spear_mean_list[best_idx]:.4f}", 
+                           fontsize=12, fontweight='bold')
+                ax.legend(fontsize=10)
+                ax.grid(True, ls="--", alpha=0.3)
+                
+                # 右图：样本数 vs 阈值
+                ax = axes[1]
+                ax.plot(thresholds, n_samples_list, 'o-', linewidth=2, 
+                       markersize=6, color='purple')
+                ax.axvline(thresholds[best_idx], color='red', linestyle='--', 
+                          linewidth=2, label=f'Best Threshold={thresholds[best_idx]:.2f}')
+                ax.set_xlabel("q Threshold", fontsize=12)
+                ax.set_ylabel("Number of Samples", fontsize=12)
+                ax.set_title("Sample Count vs q Threshold", fontsize=12, fontweight='bold')
+                ax.legend(fontsize=10)
+                ax.grid(True, ls="--", alpha=0.3)
+                
+                plt.tight_layout()
+                plt.savefig(p / "threshold_scan.png", dpi=200, bbox_inches='tight')
+                plt.close()
+            except Exception as e:
+                print(f"警告: 阈值扫描图绘制失败 - {e}")
+        
+        # ========== 5. 误差分析（残差分布）==========
+        try:
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+            
+            for i, axis in enumerate(["x", "y"]):
+                ax = axes[i]
+                residual = pred[:, i] - gt[:, i]
+                
+                # 绘制残差直方图
+                ax.hist(residual, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
+                
+                # 统计信息
+                mean_res = residual.mean()
+                std_res = residual.std()
+                ax.axvline(0, color='red', linestyle='--', linewidth=2, label='Zero Error')
+                ax.axvline(mean_res, color='green', linestyle='--', linewidth=2, 
+                          label=f'Mean={mean_res:.3f}')
+                
+                ax.set_xlabel(f"Residual (Pred - GT) for {axis}", fontsize=11)
+                ax.set_ylabel("Frequency", fontsize=11)
+                ax.set_title(f"Residual Distribution - Axis {axis.upper()}\nMean={mean_res:.3f}, Std={std_res:.3f}", 
+                           fontsize=12, fontweight='bold')
+                ax.legend(fontsize=10)
+                ax.grid(True, ls="--", alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(p / "residual_analysis.png", dpi=200, bbox_inches='tight')
+            plt.close()
+        except Exception as e:
+            print(f"警告: 残差分析图绘制失败 - {e}")
+        
+        print(f"\n✅ 可视化图表已保存到: {p}/")
+        print(f"   - scatter_logvar_x.png / scatter_logvar_y.png (LogVar散点图)")
+        print(f"   - q_distribution.png (内点概率分布)")
+        print(f"   - anisotropy_analysis.png (各向异性分析)")
+        if pred_before_sa is not None:
+            print(f"   - anisotropy_prepost.png (各向异性前后对比)")
+        if args.scan_q_threshold:
+            print(f"   - threshold_scan.png (阈值扫描曲线)")
+        print(f"   - residual_analysis.png (残差分布)")
+        print()
+
+if __name__ == "__main__":
+    main()
+
+
+```
+
+## File: fit_geom_stats.py
+
+- Extension: .py
+- Language: python
+- Size: 1432 bytes
+- Created: 2025-10-12 01:41:39
+- Modified: 2025-10-12 01:45:25
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+"""
+从训练集拟合几何特征的 mean/std（只用有效 token）
+保存为独立的统计量 NPZ，用于训练时 geoms 标准化
+"""
+import numpy as np
+import os
+
+# 训练集路径
+train_npz_path = r"F:/SLAMdata/_cache/macro/train_frame.npz"
+
+print(f"加载训练集: {train_npz_path}")
+d = np.load(train_npz_path)
+
+G = d["geoms"]            # (N, T, 24) 例如 (6553, 256, 24)
+nt = d["num_tokens"]      # (N,)
+
+print(f"  样本数: {G.shape[0]}")
+print(f"  Token容量: {G.shape[1]}")
+print(f"  几何特征维度: {G.shape[2]}")
+
+# 只统计每样本前 nt[i] 个 token
+T = G.shape[1]
+mask = (np.arange(T)[None, :] < nt[:, None])  # (N, T) - boolean mask
+# 用mask选出有效token
+valid_geoms_list = []
+for i in range(len(G)):
+    n_tok = nt[i]
+    valid_geoms_list.append(G[i, :n_tok, :])  # (n_tok, 24)
+Gs = np.concatenate(valid_geoms_list, axis=0)  # (M, 24)
+
+print(f"  有效token总数: {Gs.shape[0]}")
+
+# 计算均值和标准差
+mean = Gs.mean(0)
+std  = Gs.std(0) + 1e-8
+
+print(f"\n特征统计量:")
+print(f"  Mean 范围: [{mean.min():.4f}, {mean.max():.4f}]")
+print(f"  Std  范围: [{std.min():.4f}, {std.max():.4f}]")
+print(f"  Std  最小值: {std.min():.6f} (应 > 1e-8)")
+
+# 保存
+output_path = r"F:/SLAMdata/_cache/macro/geom_stats_24d.npz"
+np.savez(output_path, mean=mean, std=std)
+
+print(f"\n✓ 已保存: {output_path}")
+print(f"  shapes: mean={mean.shape}, std={std.shape}")
+
+```
+
+## File: plot_training_log.py
+
+- Extension: .py
+- Language: python
+- Size: 5459 bytes
+- Created: 2025-10-12 03:23:09
+- Modified: 2025-10-12 03:23:09
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+"""
+从终端日志或文件解析训练历史，绘制训练曲线
+"""
+import re
+import matplotlib.pyplot as plt
+import numpy as np
+
+def parse_log_from_text(log_text):
+    """从日志文本解析训练历史"""
+    pattern = r'\[ep (\d+)\] (?:Stage [12].*?\n)?\[ep \d+\] train_loss=([\d.]+)\s+spear_mean=([-\d.]+)\s+q_acc=([\d.]+)'
+    
+    epochs, losses, spears, q_accs = [], [], [], []
+    
+    for line in log_text.split('\n'):
+        # 匹配格式: [ep 001] train_loss=0.3465  spear_mean=-0.080  q_acc=0.804
+        match = re.search(r'\[ep (\d+)\] train_loss=([\d.]+)\s+spear_mean=([-\d.]+)\s+q_acc=([\d.]+)', line)
+        if match:
+            epochs.append(int(match.group(1)))
+            losses.append(float(match.group(2)))
+            spears.append(float(match.group(3)))
+            q_accs.append(float(match.group(4)))
+    
+    return epochs, losses, spears, q_accs
+
+# 从用户日志复制（或从文件读取）
+log_text = """
+[ep 001] Stage 1: Training q-head + shared layers only (16897/335075 params, 5.0%)
+[ep 001] train_loss=0.3465  spear_mean=-0.080  q_acc=0.804
+[ep 002] Stage 1: Training q-head + shared layers only (16897/335075 params, 5.0%)
+[ep 002] train_loss=0.2759  spear_mean=-0.079  q_acc=0.817
+[ep 003] Stage 1: Training q-head + shared layers only (16897/335075 params, 5.0%)
+[ep 003] train_loss=0.2591  spear_mean=-0.082  q_acc=0.878
+[ep 004] Stage 1: Training q-head + shared layers only (16897/335075 params, 5.0%)
+[ep 004] train_loss=0.2533  spear_mean=-0.095  q_acc=0.872
+[ep 005] Stage 1: Training q-head + shared layers only (16897/335075 params, 5.0%)
+[ep 005] train_loss=0.2485  spear_mean=-0.098  q_acc=0.881
+[ep 006] Stage 1: Training q-head + shared layers only (16897/335075 params, 5.0%)
+[ep 006] train_loss=0.2460  spear_mean=-0.105  q_acc=0.882
+[ep 007] Stage 1: Training q-head + shared layers only (16897/335075 params, 5.0%)
+[ep 007] train_loss=0.2442  spear_mean=-0.097  q_acc=0.878
+[ep 008] Stage 1: Training q-head + shared layers only (16897/335075 params, 5.0%)
+[ep 008] train_loss=0.2420  spear_mean=-0.098  q_acc=0.877
+[ep 009] Stage 2: Unfrozen all parameters (335075/335075 params)
+[ep 009] train_loss=0.3851  spear_mean=0.501  q_acc=0.905
+[ep 010] train_loss=0.3064  spear_mean=0.585  q_acc=0.905
+[ep 011] train_loss=0.2847  spear_mean=0.590  q_acc=0.922
+[ep 012] train_loss=0.2666  spear_mean=0.584  q_acc=0.922
+[ep 013] train_loss=0.2496  spear_mean=0.617  q_acc=0.925
+[ep 014] train_loss=0.2360  spear_mean=0.633  q_acc=0.922
+[ep 015] train_loss=0.2295  spear_mean=0.587  q_acc=0.922
+[ep 016] train_loss=0.2174  spear_mean=0.618  q_acc=0.920
+[ep 017] train_loss=0.2147  spear_mean=0.631  q_acc=0.921
+[ep 018] train_loss=0.2038  spear_mean=0.611  q_acc=0.922
+[ep 019] train_loss=0.2023  spear_mean=0.625  q_acc=0.909
+[ep 020] train_loss=0.1943  spear_mean=0.626  q_acc=0.884
+[ep 021] train_loss=0.1847  spear_mean=0.613  q_acc=0.884
+[ep 022] train_loss=0.1854  spear_mean=0.634  q_acc=0.919
+[ep 023] train_loss=0.1744  spear_mean=0.643  q_acc=0.912
+[ep 024] train_loss=0.1707  spear_mean=0.615  q_acc=0.901
+[ep 025] train_loss=0.1624  spear_mean=0.612  q_acc=0.915
+[ep 026] train_loss=0.1608  spear_mean=0.621  q_acc=0.900
+[ep 027] train_loss=0.1570  spear_mean=0.630  q_acc=0.896
+[ep 028] train_loss=0.1522  spear_mean=0.620  q_acc=0.905
+[ep 029] train_loss=0.1532  spear_mean=0.610  q_acc=0.915
+[ep 030] train_loss=0.1456  spear_mean=0.642  q_acc=0.905
+[ep 031] train_loss=0.1405  spear_mean=0.619  q_acc=0.912
+[ep 032] train_loss=0.1367  spear_mean=0.633  q_acc=0.909
+[ep 033] train_loss=0.1353  spear_mean=0.631  q_acc=0.897
+"""
+
+epochs, losses, spears, q_accs = parse_log_from_text(log_text)
+
+# 绘图
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+# Loss曲线
+axes[0].plot(epochs, losses, 'o-', linewidth=2, markersize=4)
+axes[0].axvline(8.5, color='red', linestyle='--', alpha=0.5, label='Stage 1→2')
+axes[0].set_xlabel('Epoch', fontsize=12)
+axes[0].set_ylabel('Train Loss', fontsize=12)
+axes[0].set_title('Training Loss', fontsize=14, fontweight='bold')
+axes[0].grid(True, alpha=0.3)
+axes[0].legend()
+
+# Spearman曲线
+axes[1].plot(epochs, spears, 'o-', linewidth=2, markersize=4, color='green')
+axes[1].axvline(8.5, color='red', linestyle='--', alpha=0.5, label='Stage 1→2')
+axes[1].axhline(max(spears), color='orange', linestyle=':', alpha=0.7, label=f'Best={max(spears):.3f}')
+axes[1].set_xlabel('Epoch', fontsize=12)
+axes[1].set_ylabel('Val Spearman', fontsize=12)
+axes[1].set_title('Validation Spearman', fontsize=14, fontweight='bold')
+axes[1].grid(True, alpha=0.3)
+axes[1].legend()
+
+# Q Accuracy曲线
+axes[2].plot(epochs, q_accs, 'o-', linewidth=2, markersize=4, color='purple')
+axes[2].axvline(8.5, color='red', linestyle='--', alpha=0.5, label='Stage 1→2')
+axes[2].set_xlabel('Epoch', fontsize=12)
+axes[2].set_ylabel('Val Q Accuracy', fontsize=12)
+axes[2].set_title('Quality Prediction Accuracy', fontsize=14, fontweight='bold')
+axes[2].grid(True, alpha=0.3)
+axes[2].legend()
+
+plt.tight_layout()
+plt.savefig('runs/macro_icgvins_v1_normalized222/training_curves.png', dpi=200)
+print("✓ 训练曲线已保存: runs/macro_icgvins_v1_normalized222/training_curves.png")
+plt.show()
+
+# 打印关键统计
+print(f"\n训练总结:")
+print(f"  总轮次: {len(epochs)}")
+print(f"  最佳Spearman: {max(spears):.3f} (Epoch {epochs[spears.index(max(spears))]})")
+print(f"  最终Loss: {losses[-1]:.4f}")
+print(f"  最终Q Acc: {q_accs[-1]:.3f}")
+
+```
+
+## File: README_OOF.md
+
+- Extension: .md
+- Language: markdown
+- Size: 4863 bytes
+- Created: 2025-10-14 00:53:53
+- Modified: 2025-10-14 20:23:46
+
+### Code
+
+```markdown
+# OOF 校准方案
+
+## 快速开始
+
+```powershell
+# 一键运行 OOF 工作流
+.\run_oof_workflow.ps1
+```
+
+## 手动运行
+
+### 1. 生成 K 折切分
+
+```powershell
+python tools/make_kfold_splits.py `
+  --train_npz F:/SLAMdata/_cache/macro/train_frame.npz `
+  --out_json runs/oof/k5_splits.json `
+  --k 5
+```
+
+### 2. OOF 训练并拟合校准器
+
+```powershell
+python tools/train_oof.py `
+  --train_npz F:/SLAMdata/_cache/macro/train_frame.npz `
+  --geom_stats_npz F:/SLAMdata/_cache/macro/geom_stats_24d.npz `
+  --kfold_json runs/oof/k5_splits.json `
+  --save_root runs/oof_macro_v1
+```
+
+### 3. 在 val/test 上评测（应用校准）
+
+```powershell
+# 验证集
+python eval_macro.py `
+  --npz F:/SLAMdata/_cache/macro/val_frame.npz `
+  --ckpt runs/oof_macro_v1/fold0/best_macro_sa.pt `
+  --geom_stats_npz F:/SLAMdata/_cache/macro/geom_stats_24d.npz `
+  --calibrator_json runs/oof_macro_v1/calibrator_oof.json `
+  --kappa 1.0 `
+  --sa_recenter `
+  --scan_q_threshold `
+  --plots_dir runs/oof_macro_v1/val_plots
+
+# 测试集
+python eval_macro.py `
+  --npz F:/SLAMdata/_cache/macro/test_frame.npz `
+  --ckpt runs/oof_macro_v1/fold0/best_macro_sa.pt `
+  --geom_stats_npz F:/SLAMdata/_cache/macro/geom_stats_24d.npz `
+  --calibrator_json runs/oof_macro_v1/calibrator_oof.json `
+  --kappa 1.0 `
+  --sa_recenter `
+  --scan_q_threshold `
+  --plots_dir runs/oof_macro_v1/test_plots
+```
+
+**注意**：`--sa_recenter` 会自动将各向异性均值校正到 OOF 训练时的目标均值，解决 κ 缩放带来的均值偏移问题。
+
+## s/a 域"幅度收缩"修正
+
+OOF 的 x/y 轴向仿射校准后，仍可能出现各向异性幅度收缩（a 的方差偏小、散点主轴斜率<1）。
+从 `calibrator_oof.json` 读取的 `sa_calib` 将在评测阶段自动应用：
+
+```json
+{
+  "x": {...}, "y": {...},
+  "sa_calib": {
+    "version": 2,
+    "mode": "robust",
+    "alpha_s": <cov/var slope>, "beta_s": <offset>,
+    "alpha_a": <std ratio>,     "beta_a": <offset>,
+    "winsor_p": 2.5
+  }
+}
+```
+
+### 校准模式
+
+- **`deming`（推荐）**：Deming 回归，考虑 x 和 y 都有误差，修正"斜率<1"的偏置
+- **`robust`**：使用 Winsorize + 稳健标准差（IQR），对异常值不敏感
+- **`by_q`**：按质量分段校准，高质量样本用更激进的参数
+- **`std`**：标准方差比方法（基线）
+
+### 参数说明
+
+**训练端（tools/train_oof.py）：**
+- `--sa_mode` (std/robust/deming/by_q, 默认deming)：s/a 校准方式
+- `--winsor_p` (默认2.5)：Winsorize 百分位（robust/by_q 模式用）
+- `--deming_lambda` (默认1.0)：Deming 回归的误差比 λ
+- `--byq_bins` (默认"0.00,0.55,1.00")：by_q 分段边界
+
+**评估端（eval_macro.py）：**
+- `--kappa` (0.6~1.0, 默认1.0)：各向异性强度缩放系数
+- `--sa_recenter`：应用 κ 后对 a 再中心到 OOF 均值（修正均值偏移）
+
+### 诊断输出
+
+评测时会输出以下诊断指标，帮助判断校准质量：
+- **OLS slope**: 各向异性主轴斜率（目标接近 1.0）
+- **Robust std ratio**: 稳健标准差比（目标接近 1.0）
+- **Quantile diff**: 分位数差异（5%, 50%, 95%）
+
+评测时会生成 `anisotropy_prepost.png` 对比图，可视化 s/a 校准前后的各向异性分布变化。
+
+## 推荐工作流
+
+1. **先用 Deming 模式**（默认）：修正"斜率<1"的回归偏置
+2. **观察诊断指标**：OLS slope、Robust std ratio、分位数差异
+3. **如果尾部仍窄**：改用 `--sa_mode by_q` 进行分段校准
+4. **始终启用 `--sa_recenter`**：修正均值偏移
+
+## 核心优势
+
+- ✅ **零数据泄露**: 校准参数完全来自训练集 OOF 预测
+- ✅ **更稳健**: 使用训练分布，不易被 val 带偏
+- ✅ **样本量大**: 使用全训练集，而非小的 val 集
+- ✅ **保序校准**: s/a 映射单调，不破坏 Spearman 排序
+- ✅ **Deming 回归**: 考虑双向误差，修正斜率偏置
+- ✅ **均值校正**: 自动修正 κ 缩放带来的均值偏移
+
+## 详细文档
+
+
+
+主要改动
+1. 
+tools/train_oof.py
+
+✅ 新增 
+deming_fit()
+ 函数（Deming 回归）
+✅ 扩展 --sa_mode 支持 4 种模式：std, robust, deming, by_q
+✅ 新增 --byq_bins 和 --deming_lambda 参数
+✅ OOF 聚合时收集 q_oof_pred（用于 by_q 分段）
+✅ JSON 中存储 a_mean_pred 和 a_mean_gt（用于 recenter）
+2. 
+eval_macro.py
+
+✅ 新增 --sa_recenter 参数（解决均值偏移）
+✅ 支持 by_q 分段应用
+✅ 导出时包含 pred_q（改名为 pred_q）
+3. 
+run_oof_workflow.ps1
+
+✅ 默认使用 --sa_mode deming（推荐从这个开始）
+✅ 评估时添加 --sa_recenter 参数
+使用方式
+方式1：使用 Deming 回归（推荐先试这个）
+
+powershell
+conda activate LAP3GPU
+.\run_oof_workflow.ps1
+
+方式2：使用 by_q 分段（如果 Deming 效果不够） 修改 
+run_oof_workflow.ps1
+ 第 45 行：
+
+powershell
+--sa_mode by_q --byq_bins 0.00,0.55,1.00
+```
+
+## File: run_oof_workflow.ps1
+
+- Extension: .ps1
+- Language: powershell
+- Size: 5028 bytes
+- Created: 2025-10-14 00:58:43
+- Modified: 2025-10-14 20:18:24
+
+### Code
+
+```powershell
+# OOF (Out-of-Fold) Calibration Workflow
+# Strict no-leakage approach: calibration from train OOF predictions only
+
+$ErrorActionPreference = "Stop"
+
+# ============================================================
+# Configuration (modify as needed)
+# ============================================================
+$TRAIN_NPZ = "F:/SLAMdata/_cache/macro/train_frame.npz"
+$VAL_NPZ = "F:/SLAMdata/_cache/macro/val_frame.npz"
+$TEST_NPZ = "F:/SLAMdata/_cache/macro/test_frame.npz"
+$GEOM_STATS = "F:/SLAMdata/_cache/macro/geom_stats_24d.npz"
+$SAVE_ROOT = "runs/oof_macro_v1"
+$K_FOLDS = 5
+
+# ============================================================
+# Step 1: Generate K-fold splits (run once)
+# ============================================================
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "Step 1: Generate K-fold splits" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+
+$KFOLD_JSON = "$SAVE_ROOT/k${K_FOLDS}_splits.json"
+
+if (Test-Path $KFOLD_JSON) {
+    Write-Host "K-fold split file exists: $KFOLD_JSON" -ForegroundColor Yellow
+    Write-Host "Skipping generation..." -ForegroundColor Yellow
+} else {
+    python tools/make_kfold_splits.py --train_npz $TRAIN_NPZ --out_json $KFOLD_JSON --k $K_FOLDS --seed 42
+    
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Error: K-fold split failed" -ForegroundColor Red
+        exit 1
+    }
+}
+
+# ============================================================
+# Step 2: OOF training and calibrator fitting (train only)
+# ============================================================
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "Step 2: OOF training and calibrator fitting" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "Note: This will train $K_FOLDS models, may take a while..." -ForegroundColor Yellow
+
+python tools/train_oof.py --train_npz $TRAIN_NPZ --geom_stats_npz $GEOM_STATS --kfold_json $KFOLD_JSON --save_root $SAVE_ROOT --epochs 40 --stage1_epochs 8 --batch_size 32 --lr 2e-4 --a_max 3.0 --drop_token_p 0.1 --heads 4 --layers 1 --d_model 128 --nll_weight 1.5 --bce_weight 0.6 --rank_weight 0.3 --patience 12 --sa_mode deming --deming_lambda 1.0
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Error: OOF training failed" -ForegroundColor Red
+    exit 1
+}
+
+$CALIBRATOR_JSON = "$SAVE_ROOT/calibrator_oof.json"
+Write-Host "`nOOF calibrator generated: $CALIBRATOR_JSON" -ForegroundColor Green
+
+# ============================================================
+# Step 3: Evaluate on validation set (apply OOF calibration)
+# ============================================================
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "Step 3: Evaluate on validation set (apply OOF calibration)" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+
+$BEST_CKPT = "$SAVE_ROOT/fold0/best_macro_sa.pt"
+
+python eval_macro.py --npz $VAL_NPZ --ckpt $BEST_CKPT --geom_stats_npz $GEOM_STATS --calibrator_json $CALIBRATOR_JSON --kappa 1.0 --sa_recenter --scan_q_threshold --plots_dir "$SAVE_ROOT/val_plots_oof"
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Error: Validation evaluation failed" -ForegroundColor Red
+    exit 1
+}
+
+# ============================================================
+# Step 4: Evaluate on test set (apply OOF calibration)
+# ============================================================
+Write-Host "`n========================================" -ForegroundColor Cyan
+Write-Host "Step 4: Evaluate on test set (apply OOF calibration)" -ForegroundColor Cyan
+Write-Host "========================================" -ForegroundColor Cyan
+
+python eval_macro.py --npz $TEST_NPZ --ckpt $BEST_CKPT --geom_stats_npz $GEOM_STATS --calibrator_json $CALIBRATOR_JSON --kappa 1.0 --sa_recenter --scan_q_threshold --plots_dir "$SAVE_ROOT/test_plots_oof"
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Error: Test evaluation failed" -ForegroundColor Red
+    exit 1
+}
+
+# ============================================================
+# Done
+# ============================================================
+Write-Host "`n========================================" -ForegroundColor Green
+Write-Host "OOF workflow completed!" -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Green
+
+Write-Host "`nResults:" -ForegroundColor Yellow
+Write-Host "  - OOF calibrator: $CALIBRATOR_JSON" -ForegroundColor White
+Write-Host "  - Validation results: $SAVE_ROOT/val_plots_oof/" -ForegroundColor White
+Write-Host "  - Test results: $SAVE_ROOT/test_plots_oof/" -ForegroundColor White
+
+Write-Host "`nOOF advantages:" -ForegroundColor Yellow
+Write-Host "  - Calibration from train OOF predictions only" -ForegroundColor White
+Write-Host "  - Val/test never used in fitting, zero leakage" -ForegroundColor White
+Write-Host "  - Uses train distribution, more robust" -ForegroundColor White
+
+```
+
+## File: train_macro.py
+
+- Extension: .py
+- Language: python
+- Size: 11096 bytes
+- Created: 2025-10-09 23:52:15
+- Modified: 2025-10-14 00:44:47
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+import argparse, os, json, random
+from pathlib import Path
+import numpy as np
+import torch, torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+from vis.datasets.macro_frames import MacroFrames
+# === 修改：从模型文件导入新的模型和损失函数 ===
+from models.macro_transformer_sa import MacroTransformerSA, CombinedUncertaintyLoss
+
+def set_seed(s=42):
+    random.seed(s); np.random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+
+def spearman_torch(x, y):
+    """
+    正确的 Spearman 相关系数实现 (PyTorch 版本)
+    先中心化，再用中心化后的值计算归一化系数
+    """
+    # x,y: (N,) torch
+    rx = torch.argsort(torch.argsort(x)).float()
+    ry = torch.argsort(torch.argsort(y)).float()
+    rx -= rx.mean()  # 先中心化
+    ry -= ry.mean()  # 先中心化
+    # 用中心化后的值计算归一化系数
+    denom = (rx.square().sum().sqrt() * ry.square().sum().sqrt()) + 1e-12
+    return (rx * ry).sum() / denom
+
+def count_trainable_params(model):
+    """统计可训练参数数量"""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return trainable, total
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--train_npz", type=str, required=True)
+    p.add_argument("--val_npz",   type=str, required=True)
+    # === 新增：特征归一化统计量文件 ===
+    p.add_argument("--geom_stats_npz", type=str, default=None,
+                   help="预计算的geoms统计量文件路径 (mean/std)，用于Z-score归一化")
+    p.add_argument("--save_dir",  type=str, default="runs/vis_macro_sa")
+    p.add_argument("--epochs",    type=int, default=30)
+    p.add_argument("--batch_size",type=int, default=32)
+    p.add_argument("--lr",        type=float, default=2e-4)
+    p.add_argument("--wd",        type=float, default=1e-4)
+    p.add_argument("--device",    type=str, default="cuda")
+    p.add_argument("--nu",        type=float, default=-1.0, help=">0 则用Student-t残差监督；<=0则回归logvar")
+    p.add_argument("--a_max",     type=float, default=3.0)
+    p.add_argument("--drop_token_p", type=float, default=0.1)
+    p.add_argument("--heads",     type=int, default=4)
+    p.add_argument("--layers",    type=int, default=1)
+    p.add_argument("--d_model",   type=int, default=128)
+    p.add_argument("--seed",      type=int, default=42)
+    p.add_argument("--logv_min",  type=float, default=-10.0)
+    p.add_argument("--logv_max",  type=float, default=6.0)
+    # === 新增：用于两阶段训练的参数 ===
+    p.add_argument("--stage1_epochs", type=int, default=0, help="Epochs for stage 1 (q-only training)")
+    p.add_argument("--nll_weight",    type=float, default=1.0, help="Weight for NLL loss")
+    p.add_argument("--bce_weight",    type=float, default=1.0, help="Weight for BCE loss")
+    p.add_argument("--rank_weight",   type=float, default=0.0, help="Weight for pairwise ranking loss")
+    p.add_argument("--rank_margin",   type=float, default=0.0, help="Margin for ranking loss")
+    # === 早停参数 ===
+    p.add_argument("--patience",      type=int, default=0, help="Early stopping patience (0=disabled)")
+    # === OOF 训练：子集索引文件 ===
+    p.add_argument("--subset_idx_file", type=str, default=None,
+                   help="Optional .npy of 1D indices to select a subset for training (for K-fold OOF)")
+    args = p.parse_args()
+
+    set_seed(args.seed)
+    os.makedirs(args.save_dir, exist_ok=True)
+    with open(Path(args.save_dir)/"hparams.json", "w") as f:
+        json.dump(vars(args), f, indent=2)
+
+    # === OOF 训练：加载子集索引 ===
+    subset_idx = None
+    if args.subset_idx_file is not None and os.path.isfile(args.subset_idx_file):
+        subset_idx = np.load(args.subset_idx_file)
+        print(f"[OOF] 加载训练子集索引: {args.subset_idx_file}")
+        print(f"[OOF] 子集大小: {len(subset_idx)}")
+
+    # === 修改：传递geom_stats_path和subset_idx到数据集 ===
+    train_ds = MacroFrames(args.train_npz, geom_stats_path=args.geom_stats_npz, subset_idx=subset_idx)
+    val_ds   = MacroFrames(args.val_npz, geom_stats_path=args.geom_stats_npz)
+
+    geom_dim = train_ds.geoms.shape[2]
+    mdl = MacroTransformerSA(
+        geom_dim=geom_dim, d_model=args.d_model, n_heads=args.heads, n_layers=args.layers,
+        a_max=args.a_max, drop_token_p=args.drop_token_p,
+        logv_min=args.logv_min, logv_max=args.logv_max
+    ).to(args.device)
+
+    opt = torch.optim.AdamW(mdl.parameters(), lr=args.lr, weight_decay=args.wd)
+    sch = CosineAnnealingLR(opt, T_max=args.epochs)
+
+    # Windows兼容：使用num_workers=0避免多进程序列化问题
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=0, pin_memory=True)
+    val_dl   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+
+    # === 新增：计算训练集内点率，用于BCE的pos_weight（类别平衡）===
+    train_inlier_rate = float(train_ds.y_inlier.mean())
+    print(f"\n训练集内点率: {train_inlier_rate*100:.1f}%")
+    if train_inlier_rate > 0 and train_inlier_rate < 1.0:
+        # pos_weight = (1-p) / p，给正样本（内点）更高权重以平衡类别
+        pos_weight_value = (1.0 - train_inlier_rate) / max(train_inlier_rate, 1e-6)
+        pos_weight = torch.tensor([pos_weight_value], device=args.device)
+        print(f"BCE pos_weight: {pos_weight_value:.3f} (平衡类别不平衡)\n")
+    else:
+        pos_weight = None
+        print("内点率为0或1，不使用pos_weight\n")
+
+    best_spear = -1.0
+    patience_counter = 0  # 早停计数器
+    for ep in range(1, args.epochs+1):
+        mdl.train()
+        lossv = []
+        
+        # === 实现两阶段训练 ===
+        is_stage1 = ep <= args.stage1_epochs
+        
+        # === 关键修改：冻结/解冻参数 ===
+        if is_stage1:
+            # 第一阶段：只训练 q_head 和共享特征层
+            for n, p in mdl.named_parameters():
+                # 只训练 q_head 和 head_shared，冻结其他所有参数
+                if 'q_head' in n or 'head_shared' in n:
+                    p.requires_grad = True
+                else:
+                    p.requires_grad = False
+            trainable, total = count_trainable_params(mdl)
+            print(f"[ep {ep:03d}] Stage 1: Training q-head + shared layers only ({trainable}/{total} params, {100*trainable/total:.1f}%)")
+        else:
+            # 第二阶段：解冻所有参数
+            if ep == args.stage1_epochs + 1:
+                for p in mdl.parameters():
+                    p.requires_grad = True
+                trainable, total = count_trainable_params(mdl)
+                print(f"[ep {ep:03d}] Stage 2: Unfrozen all parameters ({trainable}/{total} params)")
+        
+        crit = CombinedUncertaintyLoss(
+            nll_weight=args.nll_weight, 
+            bce_weight=args.bce_weight,
+            rank_weight=args.rank_weight,
+            rank_margin=args.rank_margin,
+            stage1_mode=is_stage1,
+            pos_weight=pos_weight  # 类别平衡权重
+        )
+        
+        for b in train_dl:
+            patches = b["patches"].to(args.device, non_blocking=True)
+            geoms   = b["geoms"].to(args.device, non_blocking=True)
+            y_true  = b["y_true"].to(args.device, non_blocking=True)
+            num_tok = b["num_tok"].to(args.device, non_blocking=True)
+            # === 新增：获取内点标签 ===
+            y_inlier = b["y_inlier"].to(args.device, non_blocking=True)
+
+            # === 修改：模型现在返回两个输出 ===
+            pred_logvar, pred_q_logit = mdl(patches, geoms, num_tok)
+            
+            # === 修改：使用新的损失函数 ===
+            loss = crit(pred_logvar, pred_q_logit, y_true, y_inlier)
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(mdl.parameters(), 5.0)
+            opt.step()
+            lossv.append(loss.detach().item())
+
+        sch.step()
+
+        # ----- 验证 -----
+        mdl.eval()
+        with torch.no_grad():
+            pv_logvar, pv_q, gv_logvar, gv_inlier = [], [], [], []
+            for b in val_dl:
+                pred_logvar, pred_q_logit = mdl(b["patches"].to(args.device),
+                                                b["geoms"].to(args.device),
+                                                b["num_tok"].to(args.device))
+                pv_logvar.append(pred_logvar.cpu())
+                pv_q.append(torch.sigmoid(pred_q_logit).cpu())  # 转换为概率
+                gv_logvar.append(b["y_true"])
+                gv_inlier.append(b["y_inlier"])
+            
+            pv_logvar = torch.cat(pv_logvar, 0)
+            gv_logvar = torch.cat(gv_logvar, 0)
+            pv_q = torch.cat(pv_q, 0)
+            gv_inlier = torch.cat(gv_inlier, 0)
+            
+            # 计算 spearman (只在内点上计算更有意义)
+            inlier_mask_val = (gv_inlier > 0.5).squeeze()
+            if inlier_mask_val.any():
+                sp_x = float(spearman_torch(pv_logvar[inlier_mask_val, 0], gv_logvar[inlier_mask_val, 0]))
+                sp_y = float(spearman_torch(pv_logvar[inlier_mask_val, 1], gv_logvar[inlier_mask_val, 1]))
+            else:
+                sp_x = sp_y = 0.0
+            sp_m = (sp_x + sp_y) * 0.5
+            
+            # 计算分类准确率 (Accuracy)
+            preds_q = (pv_q > 0.5).float()
+            accuracy = (preds_q == gv_inlier).float().mean()
+
+        mean_loss = sum(lossv)/max(1,len(lossv))
+        print(f"[ep {ep:03d}] train_loss={mean_loss:.4f}  spear_mean={sp_m:.3f}  q_acc={accuracy:.3f}")
+        
+        # ----- 保存 & 早停检查 -----
+        if sp_m > best_spear:
+            best_spear = sp_m
+            patience_counter = 0  # 重置计数器
+            ckpt = {
+                "model": mdl.state_dict(),
+                "args": vars(args),
+                "val_spear": {"x": sp_x, "y": sp_y, "mean": sp_m},
+                "val_q_acc": float(accuracy)
+            }
+            torch.save(ckpt, Path(args.save_dir)/"best_macro_sa.pt")
+            print(f"  ↳ saved best (mean spear={sp_m:.3f}, q_acc={accuracy:.3f})")
+        else:
+            patience_counter += 1
+            if args.patience > 0:
+                print(f"  ↳ no improvement ({patience_counter}/{args.patience})")
+        
+        # 早停触发
+        if args.patience > 0 and patience_counter >= args.patience:
+            print(f"\n[Early Stop] No improvement for {args.patience} epochs. Best spear={best_spear:.3f}")
+            print(f"[Early Stop] Stopped at epoch {ep}/{args.epochs}")
+            break
+
+if __name__ == "__main__":
+    main()
+
+
+```
+
+## File: 改进计划.txt
+
+- Extension: .txt
+- Language: plaintext
+- Size: 9554 bytes
+- Created: 2025-10-07 11:37:37
+- Modified: 2025-10-14 20:15:23
+
+### Code
+
+```plaintext
+看完你这批新版图和你仓里现有代码（project.txt 里能看到 eval_macro.py / tools/train_oof.py 的关键段），我给你一份对仓库现状贴身的改动清单。目标：把现在“主体已贴、尾部仍略窄、均值略正偏（Pred≈0.061 vs GT≈0.044）”再往前推进，并把 s/a 校准做成可插拔、可在推理期稳定复现的工程方案。
+
+下面分文件给出“搜索锚点 + 具体补丁”，你照着改即可。
+
+1) tools/train_oof.py（生成校准器）
+
+你已经有 s/a 的线性校准（mode="std"/"robust"），默认 winsorize + robust_std 还没把尾巴完全贴上；我们把 by_q 分段 和 Deming/TLS 加进来；同时存储 OOF 均值，方便推理期在任意 κ 下自动再中心。
+
+1.1 增加命令行参数（如果还没加全）
+
+在参数区加入（搜 argparse.ArgumentParser）：
+
+ap.add_argument("--sa-mode", choices=["std","robust","deming","by_q"], default="robust",
+                help="s/a 校准方式")
+ap.add_argument("--winsor-p", type=float, default=2.5, help="robust 模式下 winsorize 百分位")
+ap.add_argument("--byq-bins", type=str, default="0.00,0.55,1.00", help="by_q 分段边界，闭区间右开")
+ap.add_argument("--deming-lambda", type=float, default=1.0, help="Deming/TLS 的误差比 λ")
+
+1.2 放到文件顶部的工具函数（搜“# ===== New: s/a 域幅度校准”上方或工具函数区）
+import numpy as np
+
+def winsorize(x, p=2.5):
+    lo, hi = np.percentile(x, [p, 100-p])
+    return np.clip(x, lo, hi)
+
+def robust_std(x):
+    q1, q3 = np.percentile(x, [25, 75])
+    return (q3 - q1) / 1.349
+
+def deming_fit(x, y, lam=1.0):
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    xbar, ybar = x.mean(), y.mean()
+    sx2, sy2 = np.var(x, ddof=1), np.var(y, ddof=1)
+    sxy = np.cov(x, y, ddof=1)[0,1]
+    disc = (sy2 - lam*sx2)**2 + 4*lam*sxy**2
+    slope = (sy2 - lam*sx2 + np.sqrt(disc)) / (2*sxy + 1e-12)
+    intercept = ybar - slope * xbar
+    return float(slope), float(intercept)
+
+1.3 在“s/a 域幅度校准”块里接三种模式（搜到这行：# ===== New: s/a 域幅度校准 (在轴向仿射之后) =====）
+
+保持你原有 std/robust 分支，补上 deming 和 by_q，并存入 OOF 统计均值，供推理期“κ 后再中心”：
+
+# ---- 现有: s 的线性仿射 ----
+alpha_s = float(np.cov(s_pred, s_gt, bias=True)[0,1] / (np.var(s_pred) + 1e-12))
+beta_s  = float(s_gt.mean() - alpha_s * s_pred.mean())
+
+mode = args.sa_mode
+if mode == "std":
+    alpha_a = float(a_gt.std() / (a_pred.std() + 1e-8))
+    beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())
+
+elif mode == "robust":
+    p = args.winsor_p
+    a_pred_r, a_gt_r = winsorize(a_pred, p), winsorize(a_gt, p)
+    alpha_a = float(robust_std(a_gt_r) / (robust_std(a_pred_r) + 1e-8))
+    beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())
+
+elif mode == "deming":
+    alpha_a, beta_a = deming_fit(a_pred, a_gt, lam=args.deming_lambda)
+
+elif mode == "by_q":
+    # 需要 OOF 期间也汇总出 q 的 OOF 预测到 q_oof_pred
+    assert 'q_oof_pred' in locals(), "by_q 模式需要 q 的 OOF 预测"
+    edges = [float(x) for x in args.byq_bins.split(",")]
+    segs = []
+    q = q_oof_pred[m_xy].reshape(-1)
+
+    for left, right in zip(edges[:-1], edges[1:]):
+        mask = (q > left) & (q <= right)
+        if mask.sum() < 120:    # 样本太少就跳过
+            continue
+        ap, ag = a_pred[mask], a_gt[mask]
+        # 段内用 'robust'（也可换 deming）
+        ap_r, ag_r = winsorize(ap, 2.5), winsorize(ag, 2.5)
+        aa = float(robust_std(ag_r) / (robust_std(ap_r) + 1e-8))
+        bb = float(ag.mean() - aa * ap.mean())
+        segs.append({"q_max": right, "alpha_a": aa, "beta_a": bb})
+else:
+    raise ValueError(f"Unknown sa-mode: {mode}")
+
+# ---- 写 JSON ----
+sa_calib = {
+    "version": 2,
+    "mode": mode,
+    "alpha_s": float(alpha_s), "beta_s": float(beta_s),
+    # 记录 OOF 的均值用于 κ 后再中心
+    "a_mean_pred": float(a_pred.mean()),
+    "a_mean_gt":   float(a_gt.mean())
+}
+if mode in ["std","robust","deming"]:
+    sa_calib.update({"alpha_a": float(alpha_a), "beta_a": float(beta_a)})
+elif mode == "by_q":
+    sa_calib.update({"by_q": segs, "winsor_p": 2.5})
+
+
+注意：by_q 需要在 OOF 聚合时同时收集 q_oof_pred。你已经在 eval_macro.py 把 q 导出到 npz（pred_q），在 OOF 流程里把各 fold 的 q 也一起聚合成一条 q_oof_pred 即可（写入本文件的局部变量后就能被上面代码使用）。
+
+2) eval_macro.py（应用校准 + 诊断）
+
+你现在已经会加载 sa_calib 并做线性映射，但只覆盖“线性统一模式”，还不支持 by_q 分段。另外默认 --kappa=0.8，建议改成 1.0；并新增一个“κ 后再中心”的安全开关，解决你这批图里 a 的均值仍略正偏的问题。
+
+2.1 参数调整（搜 ap.add_argument("--kappa"）
+ap.add_argument("--kappa", type=float, default=1.0,
+                help="各向异性强度 κ ∈ [0.6,1.0]，默认1.0")
+ap.add_argument("--sa-recenter", action="store_true",
+                help="应用 κ 后对 a 再中心到 OOF 均值（使用 JSON 里的 a_mean_*）")
+
+2.2 应用 sa_calib（搜 # ===== s/a 域校准（可选 这一段，把 by_q 分支补上）
+sa = calib_data.get("sa_calib", None)
+if sa is not None:
+    pred_before_sa = pred.copy()
+
+    s_pred = 0.5 * (pred[:,0] + pred[:,1])
+    a_pred = 0.5 * (pred[:,0] - pred[:,1])
+
+    mode   = sa.get("mode", "std")
+    alpha_s = float(sa["alpha_s"]); beta_s = float(sa["beta_s"])
+    s_cal  = alpha_s * s_pred + beta_s
+
+    if mode in ["std","robust","deming"]:
+        alpha_a = float(sa["alpha_a"]); beta_a = float(sa["beta_a"])
+        a_map = alpha_a * a_pred + beta_a
+
+    elif mode == "by_q":
+        assert 'pred_q' in locals(), "by_q 需要 eval 时也有 q 预测"
+        a_map = np.empty_like(a_pred)
+        prev_qmax = -np.inf
+        for seg in sa["by_q"]:
+            qmax = float(seg["q_max"])
+            m = (pred_q.reshape(-1) > prev_qmax) & (pred_q.reshape(-1) <= qmax)
+            aa = float(seg["alpha_a"]); bb = float(seg["beta_a"])
+            a_map[m] = aa * a_pred[m] + bb
+            prev_qmax = qmax
+        # 兜底：大于最后一段的直接用最后一段
+        m = (pred_q.reshape(-1) > prev_qmax)
+        if m.any():
+            aa = float(sa["by_q"][-1]["alpha_a"]); bb = float(sa["by_q"][-1]["beta_a"])
+            a_map[m] = aa * a_pred[m] + bb
+    else:
+        raise ValueError(f"Unknown sa mode: {mode}")
+
+    # κ 缩放
+    a_adj = float(args.kappa) * a_map
+
+    # 可选：κ 后再中心（把 a 的均值校回到 OOF 的 a_mean_gt）
+    if args.sa_recenter and ("a_mean_pred" in sa) and ("a_mean_gt" in sa):
+        mu_pred = float(sa["a_mean_pred"])
+        mu_gt   = float(sa["a_mean_gt"])
+        # 让 E[κ(α a + β)] ≈ μ_gt  —— 使用 OOF 的均值闭式修正
+        # 原映射：a_map = α a + β，使 E[a_map]=μ_gt
+        # 乘 κ 后均值→ κ μ_gt，需要加回 (1-κ)*μ_gt
+        a_adj = a_adj + (1.0 - float(args.kappa)) * mu_gt
+
+    pred[:,0] = s_cal + a_adj
+    pred[:,1] = s_cal - a_adj
+
+    print(f"  s/a 校准 [{mode}]: αs={alpha_s:.4f}, βs={beta_s:.4f}, κ={args.kappa:.2f}, recenter={args.sa_recenter}")
+
+
+说明：如果 OOF 拟合时 βₐ 使得 E[αₐ·a_pred+βₐ]=μ_gt，在部署端乘上 κ 后，均值会变成 κ μ_gt。上面这行 +(1-κ)*μ_gt 就是把均值拉回 μ_gt，解决你图里 Pred 均值略高的问题（当 κ=1.0 时该项为 0，不改变现状）。
+
+2.3 诊断输出你已经加上了
+
+[Diag] slope(a_post ~ a_gt)、robust_std ratio、分位点对齐建议保留，用于快速判定“斜率是否→1、宽度是否→1、尾部是否贴”。
+
+3) OOF 聚合时把 q 也写出来（by_q 需要）
+
+在你的 OOF 汇总脚本里（你用的是多折合并环节），除了合并 oof_pred 和 y_true，同时合并每折的 q 预测成 q_oof_pred（同一顺序的 1D 向量），让 tools/train_oof.py 能在“s/a 域幅度校准”那段通过 locals() 直接拿到它（上面的代码已做了断言）。
+
+4) 运行建议
+
+先跑 robust（默认）+ κ=1.0
+
+python tools/train_oof.py --sa-mode robust --winsor-p 2.5 ...
+python eval_macro.py --calibrator_json ... --kappa 1.0 --sa-recenter ...
+
+
+观察诊断：斜率↑、robust_std_ratio→1、均值对齐后直方图峰位应与 GT 几乎重合。
+
+若尾部仍窄 → 开 by_q 两段
+
+python tools/train_oof.py --sa-mode by_q --byq-bins 0.00,0.55,1.00 ...
+python eval_macro.py --calibrator_json ... --kappa 1.0 --sa-recenter
+
+
+若主轴斜率仍 <1 → 改 deming（或 by_q 的每段里也用 deming）
+
+python tools/train_oof.py --sa-mode deming --deming-lambda 1.0 ...
+
+5) 为什么这几步能解决你现在看到的问题
+
+均值略正偏：--sa-recenter 直接在部署端把 κ 带来的均值缩放校回 OOF 的目标均值，解决 Pred=0.061 vs GT=0.044 的轻偏。
+
+尾部仍略窄：robust 已经拉开主体宽度；by_q 让高质量样本段采用更“放”的斜率和截距，能把 p5/p95 再贴一截；deming 修正“自变量带噪”带来的斜率回归到 0 的偏置。
+
+Spearman 几乎不变：s/a 校准是保序的大致单调过程（但对每轴不是严格单变量），分布会明显改善而秩序指标变化很小，这是符合你当前“阈值扫描曲线形状变化不大”的观察。
+```
+
+## File: .windsurf\workflows\openspec-apply.md
+
+- Extension: .md
+- Language: markdown
+- Size: 1246 bytes
+- Created: 2025-10-13 14:11:52
+- Modified: 2025-10-13 14:11:52
+
+### Code
+
+```markdown
+---
+description: Implement an approved OpenSpec change and keep tasks in sync.
+auto_execution_mode: 3
+---
+<!-- OPENSPEC:START -->
+**Guardrails**
+- Favor straightforward, minimal implementations first and add complexity only when it is requested or clearly required.
+- Keep changes tightly scoped to the requested outcome.
+- Refer to `openspec/AGENTS.md` (located inside the `openspec/` directory—run `ls openspec` or `openspec update` if you don't see it) if you need additional OpenSpec conventions or clarifications.
+
+**Steps**
+Track these steps as TODOs and complete them one by one.
+1. Read `changes/<id>/proposal.md`, `design.md` (if present), and `tasks.md` to confirm scope and acceptance criteria.
+2. Work through tasks sequentially, keeping edits minimal and focused on the requested change.
+3. Confirm completion before updating statuses—make sure every item in `tasks.md` is finished.
+4. Update the checklist after all work is done so each task is marked `- [x]` and reflects reality.
+5. Reference `openspec list` or `openspec show <item>` when additional context is required.
+
+**Reference**
+- Use `openspec show <id> --json --deltas-only` if you need additional context from the proposal while implementing.
+<!-- OPENSPEC:END -->
+
+```
+
+## File: .windsurf\workflows\openspec-archive.md
+
+- Extension: .md
+- Language: markdown
+- Size: 1120 bytes
+- Created: 2025-10-13 14:11:52
+- Modified: 2025-10-13 14:11:52
+
+### Code
+
+```markdown
+---
+description: Archive a deployed OpenSpec change and update specs.
+auto_execution_mode: 3
+---
+<!-- OPENSPEC:START -->
+**Guardrails**
+- Favor straightforward, minimal implementations first and add complexity only when it is requested or clearly required.
+- Keep changes tightly scoped to the requested outcome.
+- Refer to `openspec/AGENTS.md` (located inside the `openspec/` directory—run `ls openspec` or `openspec update` if you don't see it) if you need additional OpenSpec conventions or clarifications.
+
+**Steps**
+1. Identify the requested change ID (via the prompt or `openspec list`).
+2. Run `openspec archive <id> --yes` to let the CLI move the change and apply spec updates without prompts (use `--skip-specs` only for tooling-only work).
+3. Review the command output to confirm the target specs were updated and the change landed in `changes/archive/`.
+4. Validate with `openspec validate --strict` and inspect with `openspec show <id>` if anything looks off.
+
+**Reference**
+- Inspect refreshed specs with `openspec list --specs` and address any validation issues before handing off.
+<!-- OPENSPEC:END -->
+
+```
+
+## File: .windsurf\workflows\openspec-proposal.md
+
+- Extension: .md
+- Language: markdown
+- Size: 2281 bytes
+- Created: 2025-10-13 14:11:52
+- Modified: 2025-10-13 14:11:52
+
+### Code
+
+```markdown
+---
+description: Scaffold a new OpenSpec change and validate strictly.
+auto_execution_mode: 3
+---
+<!-- OPENSPEC:START -->
+**Guardrails**
+- Favor straightforward, minimal implementations first and add complexity only when it is requested or clearly required.
+- Keep changes tightly scoped to the requested outcome.
+- Refer to `openspec/AGENTS.md` (located inside the `openspec/` directory—run `ls openspec` or `openspec update` if you don't see it) if you need additional OpenSpec conventions or clarifications.
+- Identify any vague or ambiguous details and ask the necessary follow-up questions before editing files.
+
+**Steps**
+1. Review `openspec/project.md`, run `openspec list` and `openspec list --specs`, and inspect related code or docs (e.g., via `rg`/`ls`) to ground the proposal in current behaviour; note any gaps that require clarification.
+2. Choose a unique verb-led `change-id` and scaffold `proposal.md`, `tasks.md`, and `design.md` (when needed) under `openspec/changes/<id>/`.
+3. Map the change into concrete capabilities or requirements, breaking multi-scope efforts into distinct spec deltas with clear relationships and sequencing.
+4. Capture architectural reasoning in `design.md` when the solution spans multiple systems, introduces new patterns, or demands trade-off discussion before committing to specs.
+5. Draft spec deltas in `changes/<id>/specs/<capability>/spec.md` (one folder per capability) using `## ADDED|MODIFIED|REMOVED Requirements` with at least one `#### Scenario:` per requirement and cross-reference related capabilities when relevant.
+6. Draft `tasks.md` as an ordered list of small, verifiable work items that deliver user-visible progress, include validation (tests, tooling), and highlight dependencies or parallelizable work.
+7. Validate with `openspec validate <id> --strict` and resolve every issue before sharing the proposal.
+
+**Reference**
+- Use `openspec show <id> --json --deltas-only` or `openspec show <spec> --type spec` to inspect details when validation fails.
+- Search existing requirements with `rg -n "Requirement:|Scenario:" openspec/specs` before writing new ones.
+- Explore the codebase with `rg <keyword>`, `ls`, or direct file reads so proposals align with current implementation realities.
+<!-- OPENSPEC:END -->
+
+```
+
+## File: models\macro_transformer_sa.py
+
+- Extension: .py
+- Language: python
+- Size: 10564 bytes
+- Created: 2025-10-09 23:51:34
+- Modified: 2025-10-13 19:35:48
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+# models/macro_transformer_sa.py
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# --------- 可选的 Student-t NLL（ν>2更稳） ----------
+class StudentTLoss(nn.Module):
+    def __init__(self, nu: float = 3.0, reduction: str = "mean"):
+        super().__init__()
+        assert nu > 2.0
+        self.nu = nn.Parameter(torch.tensor(float(nu)), requires_grad=False)
+        self.reduction = reduction
+
+    def forward(self, pred_logvar: torch.Tensor, gt_resid: torch.Tensor):
+        # 这里给一个通用版：你若要直接回归logvar做监督，请换成 SmoothL1
+        # gt_resid: (..., 2) 真实残差(e_x, e_y)，pred_logvar: (..., 2)
+        nu = self.nu
+        v = torch.clamp(torch.exp(pred_logvar), 1e-12, 1e12)
+        z2 = (gt_resid ** 2) / v
+        # log-likelihood（省去常数项）
+        nll = 0.5 * (nu + 1.0) * torch.log1p(z2 / nu) + 0.5 * torch.log(v)
+        if self.reduction == "mean":
+            return nll.mean()
+        elif self.reduction == "sum":
+            return nll.sum()
+        else:
+            return nll
+
+# ==================== 新增：统一的损失函数 ====================
+class CombinedUncertaintyLoss(nn.Module):
+    """
+    结合异方差NLL损失和内点概率BCE损失，支持排序一致性损失。
+    """
+    def __init__(self, nll_weight=1.0, bce_weight=1.0, rank_weight=0.0, 
+                 rank_margin=0.0, stage1_mode=False, pos_weight=None):
+        super().__init__()
+        self.nll_weight = nll_weight
+        self.bce_weight = bce_weight
+        self.rank_weight = rank_weight  # 排序损失权重
+        self.rank_margin = rank_margin  # 排序边界
+        # 使用BCEWithLogitsLoss以获得更好的数值稳定性
+        # pos_weight: 给正样本(inlier=1)的权重，用于处理类别不平衡
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        self.stage1_mode = stage1_mode  # 用于两阶段训练
+
+    def _pairwise_rank_loss(self, pred, target, margin=0.0):
+        """
+        批内两两排序损失（Pairwise Ranking Loss）
+        让预测值的相对大小关系与真实值一致
+        
+        Args:
+            pred: (B,) 预测的标量值
+            target: (B,) 真实的标量值
+            margin: 排序边界（可选）
+        Returns:
+            标量损失值
+        """
+        # 构造 GT 排序关系 (i 应该比 j 大/小/相等)
+        with torch.no_grad():
+            order = target[:, None] - target[None, :]  # (B, B), >0 表示 i 的GT应高于 j
+            sign = torch.sign(order)  # +1/-1/0
+        
+        # 预测值的差异
+        diff = pred[:, None] - pred[None, :]  # (B, B)
+        
+        # Logistic ranking loss: log(1 + exp(-(pred_i - pred_j) * sign))
+        # 只对有序对 (sign != 0) 计算损失
+        loss = torch.log1p(torch.exp(-(diff - margin * sign) * sign))
+        
+        # 去掉对角线和无序对
+        mask = (sign != 0).float()
+        n_pairs = mask.sum() + 1e-6
+        
+        return (loss * mask).sum() / n_pairs
+
+    def forward(self, pred_logvar, pred_q_logit, gt_y_true, gt_y_inlier):
+        # pred_logvar: (B, 2), 模型预测的 [logσx², logσy²]
+        # pred_q_logit: (B, 1), 模型预测的内点概率的 logit
+        # gt_y_true: (B, 2), 真实标签 [logσx², logσy²]
+        # gt_y_inlier: (B, 1), 真实的内点标签 [0.0 或 1.0]
+
+        # --- 第一部分：BCE损失 (用于内点概率q) ---
+        loss_bce = self.bce_loss(pred_q_logit, gt_y_inlier)
+
+        if self.stage1_mode:
+            # 如果是第一阶段，只返回BCE损失
+            return loss_bce
+
+        # --- 第二部分：NLL损失 (用于方差σ) ---
+        # 关键：NLL损失只应该在真实的内点上计算！
+        inlier_mask = (gt_y_inlier > 0.5).squeeze(-1)
+        if not inlier_mask.any():
+            # 如果这个batch里一个内点都没有，NLL损失为0
+            loss_nll = torch.tensor(0.0, device=pred_logvar.device)
+        else:
+            # 筛选出内点进行计算
+            pred_logvar_inliers = pred_logvar[inlier_mask]
+            gt_y_true_inliers = gt_y_true[inlier_mask]
+            
+            # 使用SmoothL1回归logvar
+            loss_nll = F.smooth_l1_loss(pred_logvar_inliers, gt_y_true_inliers)
+
+        # --- 第三部分：排序一致性损失 (可选) ---
+        loss_rank = torch.tensor(0.0, device=pred_logvar.device)
+        if self.rank_weight > 0:
+            # 使用 s = (logσx² + logσy²) / 2 作为整体不确定性度量
+            s_pred = pred_logvar.mean(dim=-1)  # (B,)
+            s_gt = gt_y_true.mean(dim=-1)      # (B,)
+            loss_rank = self._pairwise_rank_loss(s_pred, s_gt, margin=self.rank_margin)
+
+        # --- 合并损失 ---
+        total_loss = self.nll_weight * loss_nll + self.bce_weight * loss_bce + self.rank_weight * loss_rank
+        return total_loss
+
+# --------- Patch + Geom → Token 的轻量编码器 ----------
+class PointEncoder(nn.Module):
+    def __init__(self, geom_dim: int, d_model: int = 128):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(2, 32, 3, 2, 1), nn.ReLU(inplace=True),   # 32->16
+            nn.Conv2d(32, 64, 3, 2, 1), nn.ReLU(inplace=True),  # 16->8
+            nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True), # 8->4
+            nn.AdaptiveAvgPool2d(1)                             # -> (B,128,1,1)
+        )
+        self.geom_mlp = nn.Sequential(
+            nn.Linear(geom_dim, 64),
+            nn.ReLU(inplace=True)
+        )
+        self.proj = nn.Linear(128 + 64, d_model)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, patches: torch.Tensor, geoms: torch.Tensor):
+        # patches: (B,K,2,H,W) in [0,1]; geoms: (B,K,G)
+        B, K, C, H, W = patches.shape
+        f_img = self.cnn(patches.reshape(B * K, C, H, W)).flatten(1)   # (B*K,128)
+        f_geo = self.geom_mlp(geoms.reshape(B * K, -1))                # (B*K,64)
+        tok = self.proj(torch.cat([f_img, f_geo], dim=1)).reshape(B, K, -1)
+        return self.norm(tok)                                          # (B,K,d)
+
+# --------- 位置编码（可选） ----------
+class SinPosEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 4096):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)  # (1,max_len,d)
+
+    def forward(self, x: torch.Tensor):
+        # x: (B,K,d)
+        return x + self.pe[:, :x.size(1), :]
+
+# --------- 宏观模型主体（SA 参数化） ----------
+class MacroTransformerSA(nn.Module):
+    def __init__(self,
+                 geom_dim: int,
+                 d_model: int = 128,
+                 n_heads: int = 4,
+                 n_layers: int = 1,
+                 a_max: float = 3.0,
+                 drop_token_p: float = 0.0,
+                 use_posenc: bool = True,
+                 logv_min: float = -10.0,
+                 logv_max: float = 6.0):
+        super().__init__()
+        self.point_encoder = PointEncoder(geom_dim=geom_dim, d_model=d_model)
+        self.cls = nn.Parameter(torch.zeros(1, 1, d_model))
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_model*4,
+            dropout=0.1, activation="relu", batch_first=True, norm_first=True
+        )
+        self.enc = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        
+        # === 修改：分离两个输出头以便独立训练 ===
+        # 共享特征提取
+        self.head_shared = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, 128),
+            nn.ReLU(inplace=True)
+        )
+        # SA参数化头（用于logvar回归）
+        self.sa_head = nn.Linear(128, 2)  # 输出 (s, a)
+        # 内点概率头（用于分类）
+        self.q_head = nn.Linear(128, 1)   # 输出 q_logit
+        
+        self.a_max = float(a_max)
+        self.drop_token_p = float(drop_token_p)
+        self.use_posenc = use_posenc
+        self.posenc = SinPosEncoding(d_model) if use_posenc else nn.Identity()
+        self.logv_min = float(logv_min)
+        self.logv_max = float(logv_max)
+
+    @torch.no_grad()
+    def _make_mask(self, B: int, K: int, num_tok: torch.Tensor):
+        # True=ignore；CLS 永不mask
+        base = torch.arange(K, device=num_tok.device)[None, :] >= num_tok[:, None]
+        return torch.cat([torch.zeros(B, 1, dtype=torch.bool, device=base.device), base], dim=1)
+
+    def forward(self, patches: torch.Tensor, geoms: torch.Tensor, num_tok: torch.Tensor):
+        # patches:(B,K,2,H,W) geoms:(B,K,G) num_tok:(B,)
+        B, K = patches.shape[:2]
+        tok = self.point_encoder(patches, geoms)           # (B,K,d)
+        if self.training and self.drop_token_p > 0:
+            drop = (torch.rand(B, K, 1, device=tok.device) < self.drop_token_p)
+            tok = tok.masked_fill(drop, 0.0)
+        tok = self.posenc(tok)
+        cls = self.cls.expand(B, -1, -1)                   # (B,1,d)
+        x = torch.cat([cls, tok], dim=1)                   # (B,K+1,d)
+        mask = self._make_mask(B, K, num_tok)              # (B,K+1)
+        out = self.enc(x, src_key_padding_mask=mask)       # (B,K+1,d)
+        h = out[:, 0]                                      # (B,d) 取CLS
+        
+        # === 共享特征 ===
+        feat = self.head_shared(h)                         # (B, 128)
+        
+        # === SA参数化头 ===
+        sa = self.sa_head(feat)                            # (B, 2)
+        s, a_raw = sa[:, 0:1], sa[:, 1:2]                  # (B, 1), (B, 1)
+        a = torch.tanh(a_raw) * self.a_max
+        lvx = torch.clamp(s + a, self.logv_min, self.logv_max)
+        lvy = torch.clamp(s - a, self.logv_min, self.logv_max)
+        pred_logvar = torch.cat([lvx, lvy], dim=-1)        # (B, 2)
+        
+        # === 内点概率头 ===
+        q_logit = self.q_head(feat)                        # (B, 1)
+        
+        return pred_logvar, q_logit                        # (B,2), (B,1)
+
+
+```
+
+## File: models\__init__.py
+
+- Extension: .py
+- Language: python
+- Size: 235 bytes
+- Created: 2025-10-10 00:00:25
+- Modified: 2025-10-10 00:01:36
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+# 宏观模式模型
+
+from .macro_transformer_sa import MacroTransformerSA, StudentTLoss, PointEncoder, SinPosEncoding
+
+__all__ = ["MacroTransformerSA", "StudentTLoss", "PointEncoder", "SinPosEncoding"]
+
+
+```
+
+## File: tools\concat_perseq_npz.py
+
+- Extension: .py
+- Language: python
+- Size: 3966 bytes
+- Created: 2025-10-07 19:11:57
+- Modified: 2025-10-07 20:23:27
+
+### Code
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+合并同一序列的多个 delta NPZ 文件（如 _d1.npz, _d2.npz）为单个文件
+"""
+import os
+import glob
+import numpy as np
+import argparse
+from pathlib import Path
+
+def concat_one(root, seq):
+    """
+    合并同一序列的所有 _d*.npz 文件
+    
+    Args:
+        root: 目录路径
+        seq: 序列名（如 "MH_01_easy"）
+    """
+    fs = sorted(glob.glob(os.path.join(root, f"{seq}_d*.npz")))
+    if not fs:
+        print(f"[skip] {seq}: no _d*.npz files found")
+        return
+    
+    print(f"[{seq}] Found {len(fs)} delta files: {[Path(f).name for f in fs]}")
+    
+    packs = [np.load(f, allow_pickle=True) for f in fs]
+    
+    # 找所有文件共有的键（排除 meta）
+    keys = set(packs[0].files)
+    for p in packs[1:]:
+        keys &= set(p.files)
+    
+    # meta 单独处理
+    data_keys = sorted(k for k in keys if k not in {"meta"})
+    
+    # 拼接数据
+    out = {}
+    for k in data_keys:
+        arrays = [p[k] for p in packs]
+        try:
+            out[k] = np.concatenate(arrays, axis=0)
+        except Exception as e:
+            print(f"  [error] Failed to concatenate '{k}': {e}")
+            shapes = [a.shape for a in arrays]
+            print(f"          Shapes: {shapes}")
+            raise
+    
+    # 合并 meta（优先使用第一个文件的 meta，更新关键字段）
+    meta = {}
+    m0 = packs[0].get("meta", None)
+    if m0 is not None:
+        meta = m0.item() if isinstance(m0, np.ndarray) else dict(m0)
+    
+    # 确保包含 pipeline 标识，检查是否有 RANSAC
+    if "pipeline" not in meta:
+        # 检查所有源文件是否包含 RANSAC
+        has_ransac = any(
+            (p.get("meta").item() if isinstance(p.get("meta"), np.ndarray) else p.get("meta") or {}).get("ransac")
+            for p in packs if p.get("meta") is not None
+        )
+        meta["pipeline"] = "strict_euroc_v2_ransac" if has_ransac else "strict_euroc_v1"
+    
+    # 收集所有 deltas
+    all_deltas = []
+    for p in packs:
+        m = p.get("meta", None)
+        if m is not None:
+            m = m.item() if isinstance(m, np.ndarray) else m
+            d = m.get("deltas", m.get("delta", None))
+            if d is not None:
+                if isinstance(d, list):
+                    all_deltas.extend(d)
+                else:
+                    all_deltas.append(d)
+    
+    if all_deltas:
+        meta["deltas"] = sorted(set(all_deltas))
+    
+    meta["note"] = f"concatenated from {len(fs)} delta files"
+    meta["source_files"] = [Path(f).name for f in fs]
+    
+    # 保存合并后的文件
+    out_path = os.path.join(root, f"{seq}.npz")
+    np.savez_compressed(out_path, **out, meta=meta)
+    
+    total_samples = out[data_keys[0]].shape[0] if data_keys else 0
+    print(f"  [OK] → {seq}.npz ({total_samples:,} total pairs)")
+    print(f"       Pipeline: {meta.get('pipeline', 'unknown')}")
+    print(f"       Deltas: {meta.get('deltas', 'N/A')}")
+
+def main():
+    ap = argparse.ArgumentParser("Concatenate per-sequence delta NPZ files")
+    ap.add_argument("--root", required=True, help="Directory containing _d*.npz files")
+    ap.add_argument("--seqs", nargs="+", required=True, help="Sequence names to process")
+    args = ap.parse_args()
+    
+    print("="*60)
+    print("合并同序列 delta 文件")
+    print("="*60)
+    print(f"Root: {args.root}")
+    print(f"Sequences: {len(args.seqs)}")
+    print()
+    
+    success = 0
+    for s in args.seqs:
+        try:
+            concat_one(args.root, s)
+            success += 1
+        except Exception as e:
+            print(f"[ERROR] {s}: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    print()
+    print("="*60)
+    print(f"完成: {success}/{len(args.seqs)} 序列")
+    print("="*60)
+
+if __name__ == "__main__":
+    main()
+
+```
+
+## File: tools\fit_geom_stats.py
+
+- Extension: .py
+- Language: python
+- Size: 3408 bytes
+- Created: 2025-10-11 13:56:41
+- Modified: 2025-10-13 14:39:12
+
+### Code
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+计算训练NPZ文件中 'geoms' 特征的均值和标准差
+这些统计量用于训练和推理时的Z-score归一化
+"""
+import argparse
+import numpy as np
+from tqdm import tqdm
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="计算几何特征的归一化统计量"
+    )
+    parser.add_argument("--train_npz", type=str, default=None,
+                        help="训练NPZ文件路径 (例如: train_frame.npz)")
+    parser.add_argument("--npz_dir", type=str, default=None,
+                        help="包含NPZ文件的目录路径")
+    parser.add_argument("--out_npz", type=str, default="./geoms_stats.npz",
+                        help="输出统计量NPZ文件路径 (例如: geoms_stats.npz)")
+    parser.add_argument("--geom_dim", type=int, default=None,
+                        help="期望的几何特征维度（用于验证）")
+    args = parser.parse_args()
+
+    # 支持两种输入模式
+    if args.train_npz:
+        print(f"正在加载数据: {args.train_npz}")
+        data = np.load(args.train_npz, allow_pickle=True)
+    elif args.npz_dir:
+        import glob
+        npz_files = glob.glob(f"{args.npz_dir}/**/*.npz", recursive=True)
+        if not npz_files:
+            print(f"❌ 未在 {args.npz_dir} 中找到NPZ文件")
+            return
+        print(f"找到 {len(npz_files)} 个NPZ文件，使用第一个: {npz_files[0]}")
+        data = np.load(npz_files[0], allow_pickle=True)
+    else:
+        print("❌ 请指定 --train_npz 或 --npz_dir")
+        return
+    
+    geoms = data['geoms']           # (M, K, D)
+    num_tokens = data['num_tokens'] # (M,)
+    
+    M, K, D = geoms.shape
+    print(f"找到 {M} 个样本, K_max={K}, geom_dim={D}")
+    
+    # 验证维度（如果指定）
+    if args.geom_dim is not None and D != args.geom_dim:
+        print(f"⚠️  警告: 期望维度={args.geom_dim}, 实际维度={D}")
+
+    # 创建mask选择有效token（非padding）
+    token_indices = np.arange(K)
+    mask = token_indices[None, :] < num_tokens[:, None]  # (M, K)
+    
+    # 应用mask并flatten得到所有有效token
+    valid_geoms = geoms[mask]  # (N_valid_tokens, D)
+    
+    print(f"有效token总数: {valid_geoms.shape[0]:,}")
+    
+    # 计算均值和标准差
+    print("正在计算均值和标准差...")
+    mean = np.mean(valid_geoms, axis=0, dtype=np.float32)
+    std = np.std(valid_geoms, axis=0, dtype=np.float32)
+    
+    # 安全检查：防止除以零（常量特征）
+    std[std < 1e-6] = 1.0
+    
+    print("\n统计量计算完成:")
+    print(f"  Mean shape: {mean.shape}")
+    print(f"  Std shape: {std.shape}")
+    
+    # 打印每个特征的统计信息
+    if 'meta' in data and 'geoms_desc' in data['meta'].item():
+        geoms_desc = data['meta'].item()['geoms_desc']
+        print("\n各特征统计信息:")
+        print(f"{'Feature':<25} {'Mean':>12} {'Std':>12}")
+        print("-" * 52)
+        for i, desc in enumerate(geoms_desc):
+            print(f"{desc:<25} {mean[i]:>12.6f} {std[i]:>12.6f}")
+    else:
+        print("\nMean:", mean)
+        print("Std:", std)
+    
+    # 保存到输出文件
+    np.savez(args.out_npz, mean=mean, std=std)
+    print(f"\n✅ 统计量已保存到: {args.out_npz}")
+
+if __name__ == "__main__":
+    main()
+
+
+```
+
+## File: tools\gen_macro_samples_euroc.py
+
+- Extension: .py
+- Language: python
+- Size: 33245 bytes
+- Created: 2025-10-09 23:59:26
+- Modified: 2025-10-11 19:26:19
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+# tools/gen_macro_samples_euroc.py
+"""
+把 EuRoC 每个帧对(i, i+Δ)的所有点匹配聚成一个"宏观样本"
+输出：train/val/test 三个 npz（或单个npz由 merge 脚本再切分）
+"""
+import argparse, os, sys
+from pathlib import Path
+import numpy as np
+import cv2
+from tqdm import tqdm
+
+# 导入现有的工具函数
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+def robust_var_mad(err):
+    """使用 MAD (Median Absolute Deviation) 估计稳健方差"""
+    err = np.asarray(err).astype(np.float64)
+    if err.size == 0: return 1e-12
+    med = np.median(err)
+    mad = np.median(np.abs(err - med))
+    sigma = 1.4826 * mad
+    return max(1e-12, float(sigma**2))
+
+def sample_or_pad(arr, K, pad_value=0):
+    """采样或填充数组到固定长度K"""
+    N = len(arr)
+    if N >= K:
+        idx = np.random.choice(N, K, replace=False)
+        return arr[idx], N
+    pad = K - N
+    if arr.ndim == 1:
+        return np.pad(arr, (0,pad), constant_values=pad_value), N
+    if arr.ndim == 2:
+        return np.pad(arr, ((0,pad),(0,0)), constant_values=pad_value), N
+    if arr.ndim == 4:
+        return np.pad(arr, ((0,pad),(0,0),(0,0),(0,0)), constant_values=pad_value), N
+    raise ValueError("unexpected ndim")
+
+def median_pixel_parallax(uv1, uv2):
+    """计算两组像素点之间的中位数视差"""
+    if uv1 is None or uv2 is None or len(uv1) == 0:
+        return 0.0
+    diff = uv2 - uv1
+    parallax = np.linalg.norm(diff, axis=1)
+    return float(np.median(parallax))
+
+# ===== 从 gen_vis_pairs_euroc_strict.py 复制核心函数 =====
+def read_cam_csv(csv_path):
+    """Read camera timestamps and image paths from EuRoC CSV."""
+    rows = []
+    with open(csv_path, 'r') as f:
+        for r in f:
+            if not r or r[0] == '#' or 'timestamp' in r: 
+                continue
+            ts, rel = r.strip().split(',')
+            rows.append((int(ts), rel))
+    ts = np.array([r[0] for r in rows], np.int64)
+    files = [Path(csv_path).parent / 'data' / r[1] for r in rows]
+    return ts, files
+
+def quat_to_R(qw, qx, qy, qz):
+    """Convert quaternion to rotation matrix."""
+    import math
+    n = math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz) + 1e-12
+    qw, qx, qy, qz = qw/n, qx/n, qy/n, qz/n
+    R = np.array([
+        [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw),   2*(qx*qz+qy*qw)],
+        [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw)],
+        [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy)]
+    ], dtype=np.float64)
+    return R
+
+def SE3(R, t):
+    """Construct 4x4 SE3 matrix from R and t."""
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
+
+def invSE3(T):
+    """Invert SE3 transformation."""
+    R = T[:3, :3]
+    t = T[:3, 3]
+    Ti = np.eye(4)
+    Ti[:3, :3] = R.T
+    Ti[:3, 3] = -R.T @ t
+    return Ti
+
+def read_gt_states(gt_csv):
+    """Read ground-truth states from EuRoC CSV."""
+    import csv
+    with open(gt_csv, 'r') as f:
+        rdr = csv.reader(f)
+        head = next(rdr)
+        idx = {name: i for i, name in enumerate(head)}
+        
+        def get_idx(keys):
+            for k in keys:
+                if k in idx: return idx[k]
+            raise KeyError(f"None of {keys} found in CSV header")
+        
+        t_i = get_idx(['#timestamp [ns]', '#timestamp', 'timestamp'])
+        px_i = get_idx([' p_RS_R_x [m]', 'p_RS_R_x [m]', 'p_RS_R_x'])
+        py_i = get_idx([' p_RS_R_y [m]', 'p_RS_R_y [m]', 'p_RS_R_y'])
+        pz_i = get_idx([' p_RS_R_z [m]', 'p_RS_R_z [m]', 'p_RS_R_z'])
+        qw_i = get_idx([' q_RS_w []', 'q_RS_w []', 'q_RS_w'])
+        qx_i = get_idx([' q_RS_x []', 'q_RS_x []', 'q_RS_x'])
+        qy_i = get_idx([' q_RS_y []', 'q_RS_y []', 'q_RS_y'])
+        qz_i = get_idx([' q_RS_z []', 'q_RS_z []', 'q_RS_z'])
+        
+        T, P, Q = [], [], []
+        for row in rdr:
+            if not row or row[0].startswith('#'): continue
+            T.append(int(row[t_i]))
+            P.append([float(row[px_i]), float(row[py_i]), float(row[pz_i])])
+            Q.append([float(row[qw_i]), float(row[qx_i]), float(row[qy_i]), float(row[qz_i])])
+    
+    return np.array(T, np.int64), np.array(P, np.float64), np.array(Q, np.float64)
+
+def interp_pose(ts_all, T_gt, P, Q):
+    """Interpolate poses at given timestamps."""
+    import math
+    def slerp(q1, q2, alpha):
+        q1 = q1 / np.linalg.norm(q1)
+        q2 = q2 / np.linalg.norm(q2)
+        dot = np.clip(np.dot(q1, q2), -1.0, 1.0)
+        if dot < 0:
+            q2 = -q2
+            dot = -dot
+        if dot > 0.9995:
+            q = (1 - alpha) * q1 + alpha * q2
+            return q / np.linalg.norm(q)
+        theta0 = math.acos(dot)
+        s0 = math.sin((1 - alpha) * theta0)
+        s1 = math.sin(alpha * theta0)
+        s = math.sin(theta0)
+        return (s0 * q1 + s1 * q2) / s
+    
+    out = []
+    for t in ts_all:
+        i = np.searchsorted(T_gt, t)
+        if i <= 0:
+            i0 = i1 = 0
+            a = 0.0
+        elif i >= len(T_gt):
+            i0 = i1 = len(T_gt) - 1
+            a = 0.0
+        else:
+            i0, i1 = i - 1, i
+            a = (t - T_gt[i0]) / (T_gt[i1] - T_gt[i0] + 1e-12)
+        p = (1 - a) * P[i0] + a * P[i1]
+        q = slerp(Q[i0], Q[i1], a)
+        out.append(SE3(quat_to_R(*q), p))
+    return out
+
+def load_cam_yaml(yaml_path):
+    """Load camera intrinsics, distortion, and extrinsics from EuRoC YAML."""
+    import yaml
+    Y = yaml.safe_load(open(yaml_path, 'r'))
+    if 'intrinsics' in Y:
+        fx, fy, cx, cy = Y['intrinsics']
+    else:
+        fx = Y['camera_matrix']['data'][0]
+        fy = Y['camera_matrix']['data'][4]
+        cx = Y['camera_matrix']['data'][2]
+        cy = Y['camera_matrix']['data'][5]
+    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], np.float64)
+    
+    if 'distortion_coefficients' in Y:
+        if isinstance(Y['distortion_coefficients'], dict):
+            D = np.array(Y['distortion_coefficients']['data'], np.float64)
+        else:
+            D = np.array(Y['distortion_coefficients'], np.float64)
+    elif 'distortion_parameters' in Y:
+        D = np.array(list(Y['distortion_parameters'].values()), np.float64)
+    else:
+        D = np.zeros((5,), np.float64)
+    
+    T_BS = np.eye(4)
+    if 'T_BS' in Y:
+        data = Y['T_BS']['data'] if isinstance(Y['T_BS'], dict) else Y['T_BS']
+        T_BS = np.array(data, dtype=np.float64).reshape(4, 4)
+    
+    return K, D, T_BS
+
+def undist_norm(K, D, pts):
+    """Undistort points and convert to normalized coordinates."""
+    pts = pts.reshape(-1, 1, 2).astype(np.float64)
+    und = cv2.undistortPoints(pts, K, D)
+    return und.reshape(-1, 2)
+
+def triangulate(K0, K1, T_cam1_cam0, x0n, x1n):
+    """Triangulate 3D points from stereo normalized coordinates."""
+    R10 = T_cam1_cam0[:3, :3]
+    t10 = T_cam1_cam0[:3, 3:4]
+    P0 = np.hstack([np.eye(3), np.zeros((3, 1))])
+    P1 = np.hstack([R10, t10])
+    X_h = cv2.triangulatePoints(P0, P1, x0n.T, x1n.T)
+    X = (X_h[:3] / (X_h[3] + 1e-12)).T
+    return X
+
+def project(K, Xc):
+    """Project 3D points in camera frame to image pixels."""
+    x = (Xc[:, :2] / (Xc[:, 2:3] + 1e-12))
+    uv = (K[:2, :2] @ x.T + K[:2, 2:3]).T
+    return uv
+
+def crop_patches(img, pts, patch=32):
+    """Crop square patches around given points."""
+    H, W = img.shape[:2]
+    h = patch // 2
+    out, ok = [], []
+    for (u, v) in pts:
+        x = int(round(u))
+        y = int(round(v))
+        if x - h < 0 or y - h < 0 or x + h >= W or y + h >= H:
+            ok.append(False)
+            continue
+        out.append(img[y - h:y + h, x - h:x + h].copy())
+        ok.append(True)
+    return np.array(out, np.uint8), np.array(ok, bool)
+
+def orb_det_desc(img, n=1200):
+    """Detect and describe ORB features."""
+    orb = cv2.ORB_create(nfeatures=n, fastThreshold=7)
+    kps, des = orb.detectAndCompute(img, None)
+    if des is None or len(kps) < 16:
+        return None, None, None
+    pts = np.array([k.pt for k in kps], np.float64)
+    sc = np.array([k.response for k in kps], np.float32)
+    return pts, des, sc
+
+def match_bf(d0, d1):
+    """Brute-force matching with cross-check."""
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(d0, d1)
+    matches = sorted(matches, key=lambda r: r.distance)
+    return np.array([[m.queryIdx, m.trainIdx] for m in matches], int)
+
+# ===== 新增：辅助函数用于高级特征 =====
+def skew3(v):
+    """Skew-symmetric matrix for cross product."""
+    return np.array([[0, -v[2], v[1]],
+                     [v[2], 0, -v[0]],
+                     [-v[1], v[0], 0]], dtype=np.float64)
+
+def sampson_err_norm(x1n, x0n, R, t):
+    """
+    计算 Sampson (一阶几何) 极线误差
+    Args:
+        x1n, x0n: [N,2] 归一化坐标（已去畸变）
+        R, t: 相对旋转和平移 (cam1 ← cam0)
+    Returns:
+        err: [N] Sampson误差
+    """
+    x0 = np.hstack([x0n, np.ones((x0n.shape[0], 1))])
+    x1 = np.hstack([x1n, np.ones((x1n.shape[0], 1))])
+    E = skew3(t) @ R  # 本质矩阵
+    Ex0 = (E @ x0.T).T
+    ETx1 = (E.T @ x1.T).T
+    x1Ex0 = np.sum(x1 * Ex0, axis=1)
+    num = x1Ex0 ** 2
+    den = Ex0[:, 0]**2 + Ex0[:, 1]**2 + ETx1[:, 0]**2 + ETx1[:, 1]**2 + 1e-12
+    return np.sqrt(num / den)
+
+def compute_geom_features_v2(xy0_px, xy2_px, x0n, x2n, X_c0, T_c2_c0, P0, P2, delta_t, K_tokens):
+    """
+    计算完整的20维几何与图像特征向量
+    Args:
+        xy0_px, xy2_px: 像素坐标 [N,2]
+        x0n, x2n: 归一化坐标 [N,2]
+        X_c0: 3D点在cam0坐标系 [N,3]
+        T_c2_c0: 相对位姿变换 [4,4]
+        P0, P2: 图像patch [N,H,W]
+        delta_t: 时间间隔（秒）
+        K_tokens: 最大token数
+    Returns:
+        feat: [N, 20] 特征向量
+    """
+    N = len(xy0_px)
+    R, t = T_c2_c0[:3,:3], T_c2_c0[:3,3]
+
+    # 1-4. (u1,v1,u2,v2) 归一化坐标
+    u1n, v1n = x0n[:, 0], x0n[:, 1]
+    u2n, v2n = x2n[:, 0], x2n[:, 1]
+
+    # 5-6. 到各自图像中心的半径
+    r1 = np.sqrt(u1n**2 + v1n**2)
+    r2 = np.sqrt(u2n**2 + v2n**2)
+
+    # 7. 视差像素 (clipped)
+    parallax_px = np.linalg.norm(xy2_px - xy0_px, axis=1)
+    parallax_px = np.clip(parallax_px, 0, 40)
+
+    # 8. 视差角 (clipped)
+    v1_dir = np.hstack([x0n, np.ones((N, 1))])
+    v1_dir /= np.linalg.norm(v1_dir, axis=1, keepdims=True)
+    X_c2 = (R @ X_c0.T + t[:, None]).T
+    v2_dir = X_c2 / (np.linalg.norm(X_c2, axis=1, keepdims=True) + 1e-12)
+    cos_parallax = np.clip(np.sum(v1_dir * v2_dir, axis=1), -1.0, 1.0)
+    parallax_deg = np.rad2deg(np.arccos(cos_parallax))
+    parallax_deg = np.clip(parallax_deg, 0, 10)
+
+    # 9. 深度倒数 (1/z)
+    depth = X_c0[:, 2]
+    inv_depth = 1.0 / np.clip(depth, 0.1, 100.0)
+    inv_depth[depth < 0.1] = 0  # 处理无效深度
+
+    # 10. 视线与基线夹角余弦
+    baseline_dir = t / (np.linalg.norm(t) + 1e-9)
+    cos_theta = np.clip(np.sum(v1_dir * baseline_dir, axis=1), -1.0, 1.0)
+
+    # 11-14. 梯度与角点强度 (patch均值)
+    grad1, grad2, corn1, corn2 = [], [], [], []
+    for p in P0:
+        gx = cv2.Sobel(p, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(p, cv2.CV_32F, 0, 1, ksize=3)
+        grad1.append(np.mean(np.sqrt(gx*gx + gy*gy)))
+        corn1.append(np.mean(cv2.cornerMinEigenVal(p, blockSize=3, ksize=3)))
+    for p in P2:
+        gx = cv2.Sobel(p, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(p, cv2.CV_32F, 0, 1, ksize=3)
+        grad2.append(np.mean(np.sqrt(gx*gx + gy*gy)))
+        corn2.append(np.mean(cv2.cornerMinEigenVal(p, blockSize=3, ksize=3)))
+
+    # 15. 尺度变化 proxy
+    scale_change = np.log(r2 / (r1 + 1e-9) + 1e-9)
+
+    # 16. Sampson/极线残差
+    sampson = sampson_err_norm(x2n, x0n, R, t)
+
+    # 17. token rank/K
+    token_rank = np.arange(N) / float(K_tokens)
+
+    # 18. Δt (normalized)
+    delta_t_norm = np.full(N, fill_value=delta_t, dtype=np.float32)
+
+    # 19-20. 曝光/亮度差 proxy
+    mean_lum1 = np.array([p.mean() for p in P0])
+    mean_lum2 = np.array([p.mean() for p in P2])
+
+    # Stack all 20 features
+    feat = np.stack([
+        u1n, v1n, u2n, v2n,                     # 1-4
+        r1, r2,                                 # 5-6
+        parallax_px, parallax_deg,              # 7-8
+        inv_depth, cos_theta,                   # 9-10
+        np.array(grad1), np.array(grad2),       # 11-12
+        np.array(corn1), np.array(corn2),       # 13-14
+        scale_change, sampson,                  # 15-16
+        token_rank, delta_t_norm,               # 17-18
+        mean_lum1, mean_lum2,                   # 19-20
+    ], axis=1).astype(np.float32)
+
+    return feat
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--euroc_root", type=str, required=True)
+    ap.add_argument("--seqs", type=str, nargs="+", required=True)
+    ap.add_argument("--cam_id", type=int, default=0)
+    ap.add_argument("--out_npz", type=str, required=True)
+    ap.add_argument("--patch", type=int, default=32)
+    ap.add_argument("--deltas", type=int, nargs="+", default=[1])
+    ap.add_argument("--frame_step", type=int, default=2)
+    ap.add_argument("--K_tokens", type=int, default=256)
+    ap.add_argument("--min_matches", type=int, default=24)
+    ap.add_argument("--err_clip_px", type=float, default=20.0,
+                    help="Robust tail clipping threshold in pixels")
+    ap.add_argument("--pos_thr_px", type=float, default=3.0,
+                    help="Base positive/negative decision threshold (pixels)")
+    ap.add_argument("--pos_thr_px_v1", type=float, default=3.0,
+                    help="Positive threshold for V1 sequences")
+    ap.add_argument("--pos_thr_px_v2", type=float, default=3.0,
+                    help="Positive threshold for V2 sequences")
+    ap.add_argument("--pos_thr_px_mh", type=float, default=3.0,
+                    help="Positive threshold for MH sequences")
+    ap.add_argument("--inlier_thr_px", type=float, default=2.0,
+                    help="Threshold for inlier label: median GT reprojection error < this = inlier")
+    
+    # 关键帧选取参数（IC-GVINS 对齐模式）
+    kf = ap.add_argument_group("Keyframe Selection (IC-GVINS aligned)")
+    kf.add_argument("--kf_enable", action="store_true",
+                    help="Enable keyframe selection mode (IC-GVINS aligned)")
+    kf.add_argument("--kf_parallax_px", type=float, default=20.0,
+                    help="Pixel parallax threshold for keyframe selection")
+    kf.add_argument("--kf_max_interval_s", type=float, default=0.5,
+                    help="Maximum time interval (seconds) between keyframes")
+    kf.add_argument("--kf_min_interval_s", type=float, default=0.08,
+                    help="Minimum time interval (seconds) between keyframes")
+    kf.add_argument("--emit_non_kf_ratio", type=float, default=0.2,
+                    help="Ratio of non-keyframe pairs to emit (for diversity)")
+    kf.add_argument("--obs_min_parallax_px", type=float, default=3.0,
+                    help="Minimum pixel parallax for observation pairs (pair_type=0); discard if below")
+    kf.add_argument("--kf_only", action="store_true",
+                    help="Only emit keyframe pairs (type=1), skip observation pairs")
+    
+    args = ap.parse_args()
+
+    # === 修改：增加一个列表来存储内点标签 ===
+    patches_all, geoms_all, ytrue_all, numtok_all, yinlier_all = [], [], [], [], []
+
+    for seq in args.seqs:
+        seq_root = Path(args.euroc_root) / seq / "mav0"
+        
+        # Read camera and ground-truth data
+        ts0, p0 = read_cam_csv(seq_root / "cam0" / "data.csv")
+        ts1, p1 = read_cam_csv(seq_root / "cam1" / "data.csv")
+        gt_t, gt_p, gt_q = read_gt_states(seq_root / "state_groundtruth_estimate0" / "data.csv")
+        
+        # Load camera parameters
+        K0, D0, Timu_cam0 = load_cam_yaml(seq_root / "cam0" / "sensor.yaml")
+        K1, D1, Timu_cam1 = load_cam_yaml(seq_root / "cam1" / "sensor.yaml")
+        
+        # Compute transformations
+        Tcam0_imu = invSE3(Timu_cam0)
+        Tcam1_imu = invSE3(Timu_cam1)
+        Tcam1_cam0 = Tcam1_imu @ Timu_cam0
+        
+        # Align lengths
+        max_delta = max(args.deltas)
+        n = min(len(ts0), len(ts1)) - max_delta
+        ts0 = ts0[:n]
+        p0 = p0[:n]
+        p1 = p1[:n]
+        
+        # Interpolate poses
+        T_w_imu_all = interp_pose(ts0, gt_t, gt_p, gt_q)
+        T_w_cam0_all = [Twi @ Timu_cam0 for Twi in T_w_imu_all]
+        
+        # 选择帧对：关键帧模式 或 默认间隔模式
+        pairs_to_process = []  # [(i, j, pair_type, parallax)]
+        
+        if args.kf_enable:
+            # ===== 关键帧选取模式（IC-GVINS 对齐）=====
+            print(f"[{seq}] Using keyframe selection mode (IC-GVINS aligned)")
+            
+            # 预先计算所有帧的 ORB 特征（用于快速关键帧判定）
+            print(f"[{seq}] Pre-computing ORB features for {n} frames...")
+            orb_cache = {}
+            for idx in tqdm(range(n), desc="ORB cache"):
+                img = cv2.imread(str(p0[idx]), cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    orb_cache[idx] = (None, None, None)
+                    continue
+                pts, des, sc = orb_det_desc(img)
+                orb_cache[idx] = (pts, des, sc)
+            
+            # 关键帧选取
+            last_kf = 0
+            last_emit_ts = ts0[0] * 1e-9  # 转换为秒
+            ts0_s = ts0 * 1e-9
+            
+            for j in range(1, n):
+                dt_emit = ts0_s[j] - last_emit_ts
+                if dt_emit < args.kf_min_interval_s:
+                    continue
+                
+                # 获取缓存的特征
+                pts_i, des_i, _ = orb_cache[last_kf]
+                pts_j, des_j, _ = orb_cache[j]
+                
+                if des_i is None or des_j is None:
+                    continue
+                
+                # 匹配特征点
+                m_idx = match_bf(des_i, des_j)
+                if len(m_idx) < args.min_matches:
+                    continue
+                
+                # 计算视差
+                uv_i = pts_i[m_idx[:, 0]]
+                uv_j = pts_j[m_idx[:, 1]]
+                para = median_pixel_parallax(uv_i, uv_j)
+                
+                dt_kf = ts0_s[j] - ts0_s[last_kf]
+                
+                # 判断是否为关键帧
+                if para > args.kf_parallax_px:
+                    # 满足视差阈值 -> 关键帧
+                    pairs_to_process.append((last_kf, j, 1, para))  # pair_type=1表示KF
+                    last_kf = j
+                    last_emit_ts = ts0_s[j]
+                elif dt_kf > args.kf_max_interval_s:
+                    # 超过最大时间间隔 -> 强制作为观测帧
+                    # ✅ 仅保留"视差>=阈值"的观测对（除非启用 kf_only）
+                    if not args.kf_only and para >= args.obs_min_parallax_px:
+                        pairs_to_process.append((last_kf, j, 0, para))  # pair_type=0表示观测帧
+                        last_emit_ts = ts0_s[j]
+            
+            # 添加一些非关键帧对以增加多样性
+            num_kf = sum(1 for _, _, pt, _ in pairs_to_process if pt == 1)
+            extra = int(num_kf * args.emit_non_kf_ratio)
+            
+            # ✅ 仅在非 kf_only 模式下注入邻帧对
+            if extra > 0 and not args.kf_only:
+                import random
+                random.seed(42)
+                cand = list(range(0, n - 5, 5))
+                random.shuffle(cand)
+                
+                for idx in cand[:extra]:
+                    if idx + 1 >= n:
+                        continue
+                    pts0, des0, _ = orb_cache[idx]
+                    pts1, des1, _ = orb_cache[idx + 1]
+                    if des0 is None or des1 is None:
+                        continue
+                    m = match_bf(des0, des1)
+                    if len(m) < args.min_matches:
+                        continue
+                    para = median_pixel_parallax(pts0[m[:, 0]], pts1[m[:, 1]])
+                    # ✅ 仅保留"视差>=阈值"的邻帧对
+                    if para >= args.obs_min_parallax_px:
+                        pairs_to_process.append((idx, idx + 1, 0, para))
+            
+            print(f"[{seq}] Selected {len(pairs_to_process)} pairs ({num_kf} KF, {len(pairs_to_process)-num_kf} obs)")
+        else:
+            # ===== 默认间隔帧模式 =====
+            print(f"[{seq}] Using default delta/step mode")
+            for i in range(0, n - max_delta - 1, args.frame_step):
+                for d in args.deltas:
+                    j = i + d
+                    if j < n:
+                        pairs_to_process.append((i, j, -1, -1.0))  # pair_type=-1表示默认模式
+        
+        # ===== 处理选定的帧对 =====
+        for (i, j, pair_type, para_pair) in tqdm(pairs_to_process, desc=f"[{seq}] processing pairs"):
+            # Read reference images
+            I0 = cv2.imread(str(p0[i]), cv2.IMREAD_GRAYSCALE)
+            I1 = cv2.imread(str(p1[i]), cv2.IMREAD_GRAYSCALE)
+            
+            if I0 is None or I1 is None:
+                continue
+            
+            # Stereo matching @ t
+            x0, d0, s0 = orb_det_desc(I0)
+            x1, d1, s1 = orb_det_desc(I1)
+            
+            if x0 is None or x1 is None:
+                continue
+            
+            idx = match_bf(d0, d1)
+            if len(idx) < 40:
+                continue
+            
+            x0m = x0[idx[:, 0]]
+            x1m = x1[idx[:, 1]]
+            
+            # Undistort → normalize → triangulate
+            x0n = undist_norm(K0, D0, x0m)
+            x1n = undist_norm(K1, D1, x1m)
+            X3d = triangulate(K0, K1, Tcam1_cam0, x0n, x1n)
+            
+            # 读取第二帧图像
+            if j >= n:
+                continue
+            
+            I2 = cv2.imread(str(p0[j]), cv2.IMREAD_GRAYSCALE)
+            if I2 is None:
+                continue
+            
+            # Compute relative pose
+            T_w_cam0_i = T_w_cam0_all[i]
+            T_w_cam0_j = T_w_cam0_all[j]
+            T_cj_ci = invSE3(T_w_cam0_j) @ T_w_cam0_i
+            
+            R01 = T_cj_ci[:3, :3]
+            t01 = T_cj_ci[:3, 3]
+            Xj = (R01 @ X3d.T + t01.reshape(3, 1)).T
+            
+            # === 新增：保存GT位姿变换的3D点用于后续计算内点标签 ===
+            Xj_gt = Xj.copy()
+            
+            # Temporal matching
+            x2, d2, s2 = orb_det_desc(I2)
+            if x2 is None:
+                continue
+            
+            m02 = match_bf(d0, d2)
+            
+            # RANSAC filtering
+            if m02 is not None and len(m02) >= 8:
+                p0_px = x0[m02[:, 0]].astype(np.float32)
+                p2_px = x2[m02[:, 1]].astype(np.float32)
+                E, inlier = cv2.findEssentialMat(
+                    p0_px, p2_px, cameraMatrix=K0,
+                    method=cv2.RANSAC, prob=0.999, threshold=1.0
+                )
+                if inlier is not None:
+                    m02 = m02[inlier.ravel().astype(bool)]
+            
+            if m02 is None or len(m02) < 20:
+                continue
+            
+            q0 = x0[m02[:, 0]]
+            u2_obs = x2[m02[:, 1]]
+            
+            # Align 3D points
+            if len(q0) == 0 or len(Xj) == 0:
+                continue
+            
+            diff = q0[:, None, :] - x0m[None, :, :]
+            dist = np.sqrt(np.sum(diff * diff, axis=2))
+            nn = np.argmin(dist, axis=1)
+            thr = 4.0 if args.kf_enable else 2.5  # 关键帧模式下使用更宽松的阈值
+            sel = (dist[np.arange(len(q0)), nn] < thr)
+            
+            if sel.sum() < 20:
+                continue
+            
+            X_sel = Xj[nn[sel]]
+            u2_obs_final = u2_obs[sel]
+            
+            # Predict and compute errors
+            u2_pred = project(K0, X_sel)
+            e = (u2_obs_final - u2_pred).astype(np.float32)
+            e2 = e * e
+            m = np.isfinite(e2).all(axis=1)
+            
+            if m.sum() == 0:
+                continue
+            
+            # Crop patches
+            P0, ok0 = crop_patches(I0, q0[sel], patch=args.patch)
+            P2, ok2 = crop_patches(I2, u2_obs_final, patch=args.patch)
+            
+            # Filter by reprojection error (per-sequence adaptive threshold)
+            err_px = np.sqrt(e2.sum(axis=1))
+            seq_upper = seq.upper()
+            pos_thr = args.pos_thr_px
+            if seq_upper.startswith("V1"):
+                pos_thr = min(pos_thr, args.pos_thr_px_v1)
+            elif seq_upper.startswith("V2"):
+                pos_thr = min(pos_thr, args.pos_thr_px_v2)
+            elif seq_upper.startswith("MH"):
+                pos_thr = max(pos_thr, args.pos_thr_px_mh)
+            good = err_px < pos_thr
+            keep = m & ok0 & ok2 & good
+            
+            if keep.sum() < args.min_matches:
+                continue
+            
+            # === 关键修改：计算 y_inlier 标签（基于GT位姿） ===
+            # 1. 找到keep中的点对应的原始3D点索引
+            nn_kept = nn[sel][keep]
+            
+            # 2. 用GT位姿的3D点计算重投影
+            X_gt_sel = Xj_gt[nn_kept]
+            u2_pred_gt = project(K0, X_gt_sel)
+            
+            # 3. 计算GT重投影误差
+            u2_obs_kept = u2_obs_final[keep]
+            e_gt = u2_obs_kept - u2_pred_gt
+            e_norm_gt = np.linalg.norm(e_gt, axis=1)
+            
+            # 4. 定义宏观内点标签：中位数GT误差小于阈值
+            median_error = np.median(e_norm_gt)
+            is_inlier_sample = 1.0 if median_error < args.inlier_thr_px else 0.0
+            
+            # Apply filters
+            e2 = e2[keep]
+            X_sel = X_sel[keep]
+            u2_obs_final = u2_obs_final[keep]
+            q0_final = q0[sel][keep]
+            P0 = P0[keep]
+            P2 = P2[keep]
+            
+            # Clip extreme outliers for robustness when aggregating labels
+            if e2.shape[0] == 0:
+                continue
+            err_px_kept = np.sqrt(e2.sum(axis=1))
+            if args.err_clip_px > 0:
+                clip_mask = err_px_kept > args.err_clip_px
+                if np.any(clip_mask):
+                    scale = args.err_clip_px / np.maximum(err_px_kept[clip_mask], 1e-6)
+                    e2[clip_mask] *= (scale[:, None] ** 2)
+            
+            # Aggregate to macro labels (MAD-robust)
+            var_x = robust_var_mad(e2[:, 0]**0.5)
+            var_y = robust_var_mad(e2[:, 1]**0.5)
+            y_true = np.array([np.log(var_x), np.log(var_y)], dtype=np.float32)
+            
+            # === 修改：计算20维几何特征 + 4维帧对上下文 ===
+            # 准备归一化坐标和时间间隔
+            x0n_final = undist_norm(K0, D0, q0_final)
+            x2n_final = undist_norm(K0, D0, u2_obs_final)
+            delta_t = (ts0[j] - ts0[i]) * 1e-9  # 转换为秒
+            
+            # 调用特征计算函数 (20维)
+            geom_20d = compute_geom_features_v2(
+                q0_final, u2_obs_final,
+                x0n_final, x2n_final,
+                X_sel, T_cj_ci,
+                P0, P2,
+                delta_t, args.K_tokens
+            )
+            
+            # 添加4维帧对上下文：[pair_type, delta_frames, delta_t, parallax_median]
+            # 如果 para_pair 未计算（=-1），则现在计算
+            if para_pair < 0:
+                para_pair = median_pixel_parallax(q0_final, u2_obs_final)
+            
+            frame_context = np.array([
+                pair_type,           # 1=KF, 0=Obs, -1=Default
+                j - i,               # 帧间隔
+                delta_t,             # 时间间隔(秒)
+                para_pair            # 帧对级中位数视差
+            ], dtype=np.float32)
+            
+            # 扩展到每个 token（广播）
+            frame_context_expanded = np.tile(frame_context, (geom_20d.shape[0], 1))
+            geom_24d = np.concatenate([geom_20d, frame_context_expanded], axis=1)  # (N, 24)
+            
+            # Stack patches (2 channels)
+            patches = np.stack([P0, P2], axis=1)  # (n,2,H,W)
+            
+            # Sample or pad to K_tokens
+            pK, realN = sample_or_pad(patches, args.K_tokens, pad_value=0)
+            gK, _     = sample_or_pad(geom_24d,  args.K_tokens, pad_value=0.0)
+            
+            patches_all.append(pK.astype(np.uint8))
+            geoms_all.append(gK.astype(np.float32))
+            ytrue_all.append(y_true)
+            numtok_all.append(np.int32(realN))
+            # === 新增：存储内点标签（用uint8节省空间）===
+            yinlier_all.append(np.array([int(is_inlier_sample)], dtype=np.uint8))
+
+    # === 修改：处理并保存新的 yinlier_all 数组 ===
+    patches_all = np.stack(patches_all, 0) if patches_all else np.empty((0,args.K_tokens,2,args.patch,args.patch), np.uint8)
+    geoms_all   = np.stack(geoms_all,   0) if geoms_all   else np.empty((0,args.K_tokens,24), np.float32)  # 改为24维
+    ytrue_all   = np.stack(ytrue_all,   0) if ytrue_all   else np.empty((0,2), np.float32)
+    numtok_all  = np.stack(numtok_all,  0) if numtok_all  else np.empty((0,),  np.int32)
+    yinlier_all = np.stack(yinlier_all, 0) if yinlier_all else np.empty((0,1), np.uint8)  # 改为uint8节省空间
+
+    os.makedirs(Path(args.out_npz).parent, exist_ok=True)
+    
+    # === 新增：24维几何特征描述（20维token级 + 4维帧对级） ===
+    geoms_desc = [
+        # Token级特征（1-20）
+        "u1_norm", "v1_norm", "u2_norm", "v2_norm",         # 1-4
+        "radius1_norm", "radius2_norm",                     # 5-6
+        "parallax_px_token", "parallax_deg_token",          # 7-8
+        "inv_depth", "cos_theta_baseline",                  # 9-10
+        "grad_mean1", "grad_mean2",                         # 11-12
+        "corner_score1", "corner_score2",                   # 13-14
+        "scale_change_log", "sampson_error",                # 15-16
+        "token_rank_norm", "delta_t_token_sec",             # 17-18
+        "mean_luminance1", "mean_luminance2",               # 19-20
+        # 帧对级特征（21-24）
+        "pair_type(1=KF,0=Obs,-1=Default)",                 # 21
+        "delta_frames_pair",                                # 22
+        "delta_t_pair_sec",                                 # 23
+        "parallax_px_median_pair"                           # 24
+    ]
+    
+    # Build metadata for reproducibility and debugging
+    meta = {
+        'seqs': args.seqs,
+        'deltas': args.deltas if not args.kf_enable else None,
+        'patch': args.patch,
+        'K_tokens': args.K_tokens,
+        'frame_step': args.frame_step if not args.kf_enable else None,
+        'min_matches': args.min_matches,
+        'pos_thr_px': args.pos_thr_px,
+        'pos_thr_px_v1': args.pos_thr_px_v1,
+        'pos_thr_px_v2': args.pos_thr_px_v2,
+        'pos_thr_px_mh': args.pos_thr_px_mh,
+        'err_clip_px': args.err_clip_px,
+        'inlier_thr_px': args.inlier_thr_px,
+        'geom_dim': 24,  # 更新为24维（20维token级 + 4维帧对级）
+        'geoms_desc': geoms_desc,
+        'y_format': 'log(MAD_var_x), log(MAD_var_y)',
+        'y_inlier_format': 'median_gt_reproj_error < inlier_thr_px',
+        'generation_mode': 'icgvins_aligned_kf' if args.kf_enable else 'default_delta_step',
+        'kf_policy': {
+            'parallax_px': args.kf_parallax_px,
+            'max_interval_s': args.kf_max_interval_s,
+            'min_interval_s': args.kf_min_interval_s,
+            'emit_non_kf_ratio': args.emit_non_kf_ratio,
+            'obs_min_parallax_px': args.obs_min_parallax_px,
+            'kf_only': args.kf_only
+        } if args.kf_enable else None,
+        'pipeline': 'macro_frame_v4_geoms24_kf',  # 更新版本号
+    }
+    
+    # === 修改：在保存时加入 y_inlier ===
+    np.savez_compressed(args.out_npz,
+                        patches=patches_all, geoms=geoms_all,
+                        y_true=ytrue_all, num_tokens=numtok_all,
+                        y_inlier=yinlier_all,  # 新增
+                        meta=meta)
+    
+    # 打印统计信息
+    inlier_count = (yinlier_all > 0.5).sum()
+    inlier_rate = inlier_count / len(yinlier_all) if len(yinlier_all) > 0 else 0.0
+    print(f"[done] saved: {args.out_npz}  samples={len(numtok_all)}  inliers={inlier_count} ({inlier_rate*100:.1f}%)")
+
+if __name__ == "__main__":
+    main()
+
+
+```
+
+## File: tools\make_kfold_splits.py
+
+- Extension: .py
+- Language: python
+- Size: 1768 bytes
+- Created: 2025-10-14 00:44:06
+- Modified: 2025-10-14 00:44:06
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+# tools/make_kfold_splits.py
+"""
+生成 K 折交叉验证的索引切分文件
+只需要运行一次，生成的 JSON 文件可以重复使用
+"""
+import argparse
+import os
+import json
+import numpy as np
+from sklearn.model_selection import KFold
+
+def main():
+    ap = argparse.ArgumentParser(description="生成 K 折交叉验证索引")
+    ap.add_argument("--train_npz", required=True, help="训练集 npz 文件路径")
+    ap.add_argument("--out_json", required=True, help="输出的折叠索引 JSON 文件")
+    ap.add_argument("--k", type=int, default=5, help="折数（默认 5）")
+    ap.add_argument("--seed", type=int, default=42, help="随机种子")
+    args = ap.parse_args()
+
+    # 读取训练集获取样本数
+    data = np.load(args.train_npz)
+    M = int(data["y_true"].shape[0])  # 样本数
+    print(f"训练集样本数: {M}")
+    
+    idx = np.arange(M)
+
+    # K 折切分
+    kf = KFold(n_splits=args.k, shuffle=True, random_state=args.seed)
+    folds = []
+    for fold_idx, (tr, va) in enumerate(kf.split(idx)):
+        folds.append({
+            "fold": fold_idx,
+            "train_idx": tr.tolist(),
+            "val_idx": va.tolist(),
+            "n_train": len(tr),
+            "n_val": len(va)
+        })
+        print(f"Fold {fold_idx}: train={len(tr)}, val={len(va)}")
+
+    # 保存到 JSON
+    output = {
+        "k": args.k,
+        "seed": args.seed,
+        "total_samples": M,
+        "folds": folds
+    }
+    
+    os.makedirs(os.path.dirname(args.out_json) or ".", exist_ok=True)
+    with open(args.out_json, "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    
+    print(f"\n✅ K 折切分已保存到: {args.out_json}")
+
+if __name__ == "__main__":
+    main()
+
+```
+
+## File: tools\train_oof.py
+
+- Extension: .py
+- Language: python
+- Size: 12479 bytes
+- Created: 2025-10-14 00:45:59
+- Modified: 2025-10-14 20:17:07
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+# tools/train_oof.py
+"""
+OOF (Out-of-Fold) 训练脚本
+对训练集进行 K 折交叉训练，收集每个样本的 OOF 预测，然后拟合校准器
+"""
+import argparse
+import os
+import json
+import subprocess
+import tempfile
+import numpy as np
+from pathlib import Path
+import sys
+
+# 添加项目根目录到路径
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from vis.calibration.affine import AffineCalibrator
+
+# ===== 新增：稳健统计工具函数 =====
+def winsorize(x, p=2.5):
+    """Winsorize: 将极端值截断到指定百分位"""
+    lo, hi = np.percentile(x, [p, 100-p])
+    return np.clip(x, lo, hi)
+
+def robust_std(x):
+    """稳健标准差估计：基于IQR（四分位距）"""
+    q1, q3 = np.percentile(x, [25, 75])
+    return (q3 - q1) / 1.349  # 正态分布下 IQR -> sigma
+
+def deming_fit(x, y, lam=1.0):
+    """Deming 回归（TLS 的加权版本）：考虑 x 和 y 都有误差"""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    xbar, ybar = x.mean(), y.mean()
+    sx2, sy2 = np.var(x, ddof=1), np.var(y, ddof=1)
+    sxy = np.cov(x, y, ddof=1)[0,1]
+    disc = (sy2 - lam*sx2)**2 + 4*lam*sxy**2
+    slope = (sy2 - lam*sx2 + np.sqrt(disc)) / (2*sxy + 1e-12)
+    intercept = ybar - slope * xbar
+    return float(slope), float(intercept)
+
+def run_cmd(cmd):
+    """运行命令并打印"""
+    print("\n" + "="*80)
+    print(">>", " ".join(cmd))
+    print("="*80)
+    subprocess.check_call(cmd)
+
+def dump_fold_indices(tmp_dir, arr, name):
+    """将索引数组保存为 npy 文件"""
+    p = Path(tmp_dir) / f"{name}.npy"
+    np.save(p.as_posix(), arr.astype(np.int64))
+    return p.as_posix()
+
+def main():
+    ap = argparse.ArgumentParser(description="OOF 训练并拟合校准器")
+    ap.add_argument("--train_npz", required=True, help="训练集 npz 文件")
+    ap.add_argument("--geom_stats_npz", required=True, help="几何特征统计量文件")
+    ap.add_argument("--kfold_json", required=True, help="K 折切分 JSON 文件")
+    ap.add_argument("--save_root", required=True, help="保存根目录")
+    
+    # 训练超参数
+    ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--stage1_epochs", type=int, default=8)
+    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--a_max", type=float, default=3.0)
+    ap.add_argument("--drop_token_p", type=float, default=0.1)
+    ap.add_argument("--heads", type=int, default=4)
+    ap.add_argument("--layers", type=int, default=1)
+    ap.add_argument("--d_model", type=int, default=128)
+    ap.add_argument("--nll_weight", type=float, default=1.5)
+    ap.add_argument("--bce_weight", type=float, default=0.6)
+    ap.add_argument("--rank_weight", type=float, default=0.3)
+    ap.add_argument("--patience", type=int, default=12)
+    
+    # === s/a 校准参数 ===
+    ap.add_argument("--sa_mode", choices=["std", "robust", "deming", "by_q"], default="robust",
+                   help="s/a 校准方式: std=标准方差比, robust=稳健估计(默认), deming=Deming回归, by_q=按质量分段")
+    ap.add_argument("--winsor_p", type=float, default=2.5,
+                   help="Winsorize 百分位(robust/by_q模式用, 默认2.5)")
+    ap.add_argument("--byq_bins", type=str, default="0.00,0.55,1.00",
+                   help="by_q 分段边界，逗号分隔 (默认: 0.00,0.55,1.00)")
+    ap.add_argument("--deming_lambda", type=float, default=1.0,
+                   help="Deming 回归的误差比 λ (默认1.0)")
+    
+    args = ap.parse_args()
+
+    Path(args.save_root).mkdir(parents=True, exist_ok=True)
+    
+    # 加载 K 折配置
+    with open(args.kfold_json, "r", encoding="utf-8") as f:
+        kconf = json.load(f)
+    folds = kconf["folds"]
+    print(f"\n加载 K 折配置: {len(folds)} 折")
+
+    # 载入训练集真值（用于最终拟合校准）
+    tr_data = np.load(args.train_npz)
+    y_true  = tr_data["y_true"]  # (M,2) logvar_x, logvar_y
+    M = len(y_true)
+    print(f"训练集样本数: {M}")
+
+    # 准备 OOF 预测容器
+    oof_pred = np.full((M, 2), np.nan, dtype=np.float32)  # [N, 2]: logvar_x, logvar_y
+    q_oof_pred = np.full(M, np.nan, dtype=np.float32)  # [N]: 内点概率 q
+
+    with tempfile.TemporaryDirectory() as tdir:
+        for k, f in enumerate(folds):
+            print(f"\n{'='*80}")
+            print(f"开始训练 Fold {k}/{len(folds)}")
+            print(f"{'='*80}")
+            
+            tr_idx = np.array(f["train_idx"], dtype=np.int64)
+            va_idx = np.array(f["val_idx"], dtype=np.int64)
+            
+            print(f"  训练样本: {len(tr_idx)}")
+            print(f"  验证样本: {len(va_idx)}")
+
+            # 保存训练索引到临时文件
+            tr_idx_npy = dump_fold_indices(tdir, tr_idx, f"tr_idx_fold{k}")
+            
+            # 训练：只喂 train_idx 子集
+            save_dir = os.path.join(args.save_root, f"fold{k}")
+            train_cmd = [
+                "python", "train_macro.py",
+                "--train_npz", args.train_npz,
+                "--val_npz", args.train_npz,  # 用同一文件，但 val 不使用 subset
+                "--geom_stats_npz", args.geom_stats_npz,
+                "--save_dir", save_dir,
+                "--epochs", str(args.epochs),
+                "--stage1_epochs", str(args.stage1_epochs),
+                "--batch_size", str(args.batch_size),
+                "--lr", str(args.lr),
+                "--a_max", str(args.a_max),
+                "--drop_token_p", str(args.drop_token_p),
+                "--heads", str(args.heads),
+                "--layers", str(args.layers),
+                "--d_model", str(args.d_model),
+                "--nll_weight", str(args.nll_weight),
+                "--bce_weight", str(args.bce_weight),
+                "--rank_weight", str(args.rank_weight),
+                "--patience", str(args.patience),
+                "--subset_idx_file", tr_idx_npy  # 关键：训练只见本折的训练子集
+            ]
+            run_cmd(train_cmd)
+
+            # 用该折模型在"未见过"的 va_idx 上做预测
+            va_idx_npy = dump_fold_indices(tdir, va_idx, f"va_idx_fold{k}")
+            pred_npz = os.path.join(save_dir, f"oof_fold{k}.npz")
+            
+            eval_cmd = [
+                "python", "eval_macro.py",
+                "--npz", args.train_npz,
+                "--ckpt", os.path.join(save_dir, "best_macro_sa.pt"),
+                "--geom_stats_npz", args.geom_stats_npz,
+                "--subset_idx_file", va_idx_npy,  # 只评测本折的 holdout
+                "--dump_preds_npz", pred_npz  # 导出预测
+            ]
+            run_cmd(eval_cmd)
+
+            # 读取该折 OOF 预测结果
+            ck = np.load(pred_npz)
+            oof_pred[va_idx, 0] = ck["pred_logvar_x"]
+            oof_pred[va_idx, 1] = ck["pred_logvar_y"]
+            # 收集 q 预测（如果存在）
+            if "pred_q" in ck:
+                q_oof_pred[va_idx] = ck["pred_q"]
+            
+            print(f"\n✅ Fold {k} 完成，OOF 预测已收集")
+
+    # 检查 OOF 覆盖率
+    coverage_x = (~np.isnan(oof_pred[:, 0])).sum()
+    coverage_y = (~np.isnan(oof_pred[:, 1])).sum()
+    print(f"\n{'='*80}")
+    print(f"OOF 预测覆盖率:")
+    print(f"  LogVar-X: {coverage_x}/{M} ({coverage_x/M*100:.1f}%)")
+    print(f"  LogVar-Y: {coverage_y}/{M} ({coverage_y/M*100:.1f}%)")
+    print(f"{'='*80}")
+
+    # 拟合全训练集 OOF 的仿射校准器（x、y 各一套）
+    print("\n开始拟合 OOF 校准器...")
+    
+    cal_x = AffineCalibrator("logvar_x_oof")
+    cal_y = AffineCalibrator("logvar_y_oof")
+
+    m_x = ~np.isnan(oof_pred[:, 0])
+    m_y = ~np.isnan(oof_pred[:, 1])
+
+    cal_x.fit(oof_pred[m_x, 0], y_true[m_x, 0])
+    cal_y.fit(oof_pred[m_y, 1], y_true[m_y, 1])
+    
+    print(f"  LogVar-X 校准: α={cal_x.alpha:.4f}, β={cal_x.beta:.4f}")
+    print(f"  LogVar-Y 校准: α={cal_y.alpha:.4f}, β={cal_y.beta:.4f}")
+
+    # ===== New: s/a 域幅度校准 (在轴向仿射之后) =====
+    m_xy = (~np.isnan(oof_pred[:, 0])) & (~np.isnan(oof_pred[:, 1]))
+    # 先把 OOF 预测用 x/y 仿射拉正，再在 s/a 域拟合
+    px = cal_x.apply(oof_pred[m_xy, 0])
+    py = cal_y.apply(oof_pred[m_xy, 1])
+    s_pred = 0.5 * (px + py)
+    a_pred = 0.5 * (px - py)
+    s_gt   = 0.5 * (y_true[m_xy, 0] + y_true[m_xy, 1])
+    a_gt   = 0.5 * (y_true[m_xy, 0] - y_true[m_xy, 1])
+
+    def _safe_var(x, eps=1e-12): return float(np.var(x)) + eps
+    # s: 协方差比/方差比形式的仿射（多为平移修正）
+    alpha_s = float(np.cov(s_pred, s_gt, bias=True)[0,1] / _safe_var(s_pred))
+    beta_s  = float(s_gt.mean() - alpha_s * s_pred.mean())
+    
+    # a: 根据模式选择方差匹配方法
+    mode = args.sa_mode
+    sa_calib = {
+        "version": 2,
+        "mode": mode,
+        "alpha_s": alpha_s, 
+        "beta_s": beta_s,
+        "a_mean_pred": float(a_pred.mean()),
+        "a_mean_gt": float(a_gt.mean())
+    }
+    
+    if mode == "std":
+        # 标准方法：直接用标准差比
+        alpha_a = float(a_gt.std() / (a_pred.std() + 1e-8))
+        beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())
+        sa_calib.update({"alpha_a": alpha_a, "beta_a": beta_a})
+        print(f"  s/a calib [std]: αs={alpha_s:.4f}, βs={beta_s:.4f}, αa={alpha_a:.4f}, βa={beta_a:.4f}")
+        
+    elif mode == "robust":
+        # 稳健方法：先 winsorize 再用 robust_std
+        p = args.winsor_p
+        a_pred_w = winsorize(a_pred, p)
+        a_gt_w = winsorize(a_gt, p)
+        alpha_a = float(robust_std(a_gt_w) / (robust_std(a_pred_w) + 1e-8))
+        beta_a  = float(a_gt.mean() - alpha_a * a_pred.mean())
+        sa_calib.update({"alpha_a": alpha_a, "beta_a": beta_a, "winsor_p": p})
+        print(f"  s/a calib [robust]: αs={alpha_s:.4f}, βs={beta_s:.4f}, αa={alpha_a:.4f}, βa={beta_a:.4f}, winsor_p={p:.1f}")
+        
+    elif mode == "deming":
+        # Deming 回归：考虑 x 和 y 都有误差
+        alpha_a, beta_a = deming_fit(a_pred, a_gt, lam=args.deming_lambda)
+        sa_calib.update({"alpha_a": alpha_a, "beta_a": beta_a, "deming_lambda": args.deming_lambda})
+        print(f"  s/a calib [deming]: αs={alpha_s:.4f}, βs={beta_s:.4f}, αa={alpha_a:.4f}, βa={beta_a:.4f}, λ={args.deming_lambda:.2f}")
+        
+    elif mode == "by_q":
+        # 按质量分段：需要 q_oof_pred
+        if np.isnan(q_oof_pred[m_xy]).all():
+            raise ValueError("by_q 模式需要 q 的 OOF 预测，但未找到 pred_q")
+        
+        edges = [float(x) for x in args.byq_bins.split(",")]
+        segs = []
+        q = q_oof_pred[m_xy]
+        
+        for left, right in zip(edges[:-1], edges[1:]):
+            mask = (q > left) & (q <= right)
+            if mask.sum() < 120:
+                print(f"  警告: 段 ({left:.2f}, {right:.2f}] 样本数 {mask.sum()} < 120，跳过")
+                continue
+            
+            ap, ag = a_pred[mask], a_gt[mask]
+            # 段内用 robust 方法
+            ap_r, ag_r = winsorize(ap, 2.5), winsorize(ag, 2.5)
+            aa = float(robust_std(ag_r) / (robust_std(ap_r) + 1e-8))
+            bb = float(ag.mean() - aa * ap.mean())
+            segs.append({"q_max": right, "alpha_a": aa, "beta_a": bb})
+            print(f"    段 ({left:.2f}, {right:.2f}]: n={mask.sum()}, αa={aa:.4f}, βa={bb:.4f}")
+        
+        sa_calib.update({"by_q": segs, "winsor_p": 2.5})
+        print(f"  s/a calib [by_q]: αs={alpha_s:.4f}, βs={beta_s:.4f}, {len(segs)} 段")
+    
+    else:
+        raise ValueError(f"Unknown sa_mode: {mode}")
+
+    # 保存校准器（向后兼容）
+    calib_path = os.path.join(args.save_root, "calibrator_oof.json")
+    payload = {"x": cal_x.to_dict(), "y": cal_y.to_dict(), "sa_calib": sa_calib}
+    with open(calib_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    
+    print(f"\n✅ OOF 校准器已保存到: {calib_path}")
+    print(f"\n{'='*80}")
+    print("OOF 训练完成！")
+    print(f"{'='*80}")
+    print("\n下一步：使用以下命令在 val/test 上评测（应用校准）:")
+    print(f"\npython eval_macro.py \\")
+    print(f"  --npz <val_or_test.npz> \\")
+    print(f"  --ckpt <your_model.pt> \\")
+    print(f"  --geom_stats_npz {args.geom_stats_npz} \\")
+    print(f"  --calibrator_json {calib_path} \\")
+    print(f"  --scan_q_threshold \\")
+    print(f"  --plots_dir <output_dir>")
+
+if __name__ == "__main__":
+    main()
+
+```
+
+## File: tools\visualize_data_quality.py
+
+- Extension: .py
+- Language: python
+- Size: 8223 bytes
+- Created: 2025-10-05 10:44:45
+- Modified: 2025-10-05 10:56:35
+
+### Code
+
+```python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+数据质量可视化工具
+用于对比训练集和验证集的误差分布、图像质量等
+帮助诊断train降val不降的问题
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+import argparse
+from pathlib import Path
+
+def plot_distributions(ax, data, name):
+    """绘制误差分布直方图"""
+    e2_total = data['e2x'] + data['e2y']
+    err_total = np.sqrt(e2_total)
+    
+    # 统计信息
+    mean_err = np.mean(err_total)
+    median_err = np.median(err_total)
+    p95_err = np.percentile(err_total, 95)
+    
+    ax.hist(err_total, bins=100, range=(0, 20), density=True, alpha=0.7, 
+            label=f'{name.upper()} (mean={mean_err:.2f}, p95={p95_err:.2f})')
+    ax.set_title(f'Reprojection Error Distribution - {name.capitalize()} Set')
+    ax.set_xlabel('Reprojection Error (pixels)')
+    ax.set_ylabel('Density')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 添加统计信息文本
+    stats_text = f'Mean: {mean_err:.2f}px\nMedian: {median_err:.2f}px\n95th: {p95_err:.2f}px'
+    ax.text(0.98, 0.98, stats_text, transform=ax.transAxes, 
+            verticalalignment='top', horizontalalignment='right',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+def plot_patches(ax, data, name, indices):
+    """绘制样本图像块"""
+    patches = data['I0'][indices, 0]  # 显示第一帧的patch
+    n = len(indices)
+    for i in range(n):
+        ax[i].imshow(patches[i], cmap='gray', vmin=0, vmax=1)
+        ax[i].set_xticks([])
+        ax[i].set_yticks([])
+        if i == 0:
+            ax[i].set_ylabel(f'{name.upper()}', fontsize=10, fontweight='bold')
+
+def plot_geom_features(ax, data, name):
+    """绘制几何特征分布（前4维：归一化坐标）"""
+    geom = data['geom']
+    
+    # 只显示前4维（归一化坐标）
+    for i in range(min(4, geom.shape[1])):
+        ax.hist(geom[:, i], bins=50, alpha=0.5, label=f'dim {i}')
+    
+    ax.set_title(f'Geometric Features (coords) - {name.capitalize()}')
+    ax.set_xlabel('Normalized Value')
+    ax.set_ylabel('Count')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+def plot_gradient_features(ax, data, name):
+    """绘制梯度特征分布（第5-6维）"""
+    geom = data['geom']
+    
+    if geom.shape[1] >= 6:
+        g0 = geom[:, 4]  # gradient at frame 0
+        g2 = geom[:, 5]  # gradient at frame 2
+        
+        ax.hist(g0, bins=50, alpha=0.6, label='g0 (frame 0)', range=(0, 100))
+        ax.hist(g2, bins=50, alpha=0.6, label='g2 (frame 2)', range=(0, 100))
+        
+        ax.set_title(f'Gradient Magnitude - {name.capitalize()}')
+        ax.set_xlabel('Gradient Value')
+        ax.set_ylabel('Count')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # 统计低梯度样本比例
+        low_grad_ratio = np.mean((g0 < 10) | (g2 < 10))
+        ax.text(0.98, 0.98, f'Low gradient (<10): {low_grad_ratio*100:.1f}%', 
+                transform=ax.transAxes, verticalalignment='top', horizontalalignment='right',
+                bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5))
+    else:
+        ax.text(0.5, 0.5, 'No gradient features\n(geom_dim < 6)', 
+                ha='center', va='center', transform=ax.transAxes)
+        ax.set_title(f'Gradient Features - {name.capitalize()}')
+
+def main():
+    parser = argparse.ArgumentParser(description="Compare train and validation NPZ data quality.")
+    parser.add_argument('--train_npz', type=str, required=True, help='Path to train NPZ file')
+    parser.add_argument('--val_npz', type=str, required=True, help='Path to validation NPZ file')
+    parser.add_argument('--out', type=str, default='data_quality_comparison.png', 
+                       help='Output figure path')
+    args = parser.parse_args()
+
+    print("\n" + "="*60)
+    print("📊 数据质量可视化工具")
+    print("="*60)
+    
+    print(f"\n[1/3] 加载数据...")
+    train_data = np.load(args.train_npz, allow_pickle=True)
+    val_data = np.load(args.val_npz, allow_pickle=True)
+    
+    print(f"  训练集: {len(train_data['I0'])} 样本")
+    print(f"  验证集: {len(val_data['I0'])} 样本")
+    print(f"  几何特征维度: {train_data['geom'].shape[1]}")
+    
+    # 打印元数据
+    if 'meta' in train_data:
+        train_meta = train_data['meta'].item() if isinstance(train_data['meta'], np.ndarray) else train_data['meta']
+        print(f"\n  训练集序列: {train_meta.get('seqs', 'N/A')}")
+    if 'meta' in val_data:
+        val_meta = val_data['meta'].item() if isinstance(val_data['meta'], np.ndarray) else val_data['meta']
+        print(f"  验证集序列: {val_meta.get('seqs', 'N/A')}")
+    
+    print(f"\n[2/3] 生成可视化...")
+    
+    # 创建图形
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(4, 4, hspace=0.3, wspace=0.3)
+    
+    # 第一行：误差分布对比
+    ax1 = fig.add_subplot(gs[0, :2])
+    plot_distributions(ax1, train_data, 'train')
+    ax2 = fig.add_subplot(gs[0, 2:])
+    plot_distributions(ax2, val_data, 'val')
+    
+    # 第二行：几何特征分布
+    ax3 = fig.add_subplot(gs[1, :2])
+    plot_geom_features(ax3, train_data, 'train')
+    ax4 = fig.add_subplot(gs[1, 2:])
+    plot_geom_features(ax4, val_data, 'val')
+    
+    # 第三行：梯度特征分布
+    ax5 = fig.add_subplot(gs[2, :2])
+    plot_gradient_features(ax5, train_data, 'train')
+    ax6 = fig.add_subplot(gs[2, 2:])
+    plot_gradient_features(ax6, val_data, 'val')
+    
+    # 第四行：样本图像块
+    print("  随机选择样本进行可视化...")
+    rng = np.random.default_rng(0)
+    train_indices = rng.choice(len(train_data['I0']), 4, replace=False)
+    val_indices = rng.choice(len(val_data['I0']), 4, replace=False)
+    
+    train_patch_axes = [fig.add_subplot(gs[3, i]) for i in range(4)]
+    plot_patches(train_patch_axes, train_data, 'train', train_indices)
+    
+    val_patch_axes = [fig.add_subplot(gs[3, i]) for i in range(4)]
+    plot_patches(val_patch_axes, val_data, 'val', val_indices)
+    
+    # 添加总标题
+    fig.suptitle('Training vs Validation Data Quality Comparison', 
+                fontsize=16, fontweight='bold', y=0.995)
+    
+    # 保存图像
+    out_path = Path(args.out)
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    
+    print(f"\n[3/3] 保存完成")
+    print(f"  ✅ 对比图已保存到: {out_path.absolute()}")
+    
+    # 计算并打印关键差异
+    print(f"\n" + "="*60)
+    print("📈 关键差异分析")
+    print("="*60)
+    
+    train_err = np.sqrt(train_data['e2x'] + train_data['e2y'])
+    val_err = np.sqrt(val_data['e2x'] + val_data['e2y'])
+    
+    print(f"\n误差统计:")
+    print(f"  训练集 - 均值: {np.mean(train_err):.2f}px, 中位数: {np.median(train_err):.2f}px")
+    print(f"  验证集 - 均值: {np.mean(val_err):.2f}px, 中位数: {np.median(val_err):.2f}px")
+    print(f"  差异率: {(np.mean(val_err)/np.mean(train_err)-1)*100:+.1f}%")
+    
+    if train_data['geom'].shape[1] >= 6:
+        train_grad = train_data['geom'][:, 4:6].mean()
+        val_grad = val_data['geom'][:, 4:6].mean()
+        print(f"\n梯度统计:")
+        print(f"  训练集平均梯度: {train_grad:.2f}")
+        print(f"  验证集平均梯度: {val_grad:.2f}")
+        print(f"  差异率: {(val_grad/train_grad-1)*100:+.1f}%")
+    
+    if np.mean(val_err) > np.mean(train_err) * 1.2:
+        print(f"\n⚠️  警告: 验证集误差比训练集高20%以上！")
+        print(f"   这可能导致train降val不降的问题。")
+        print(f"   建议:")
+        print(f"   1. 检查数据划分是否合理（easy/medium/difficult混合）")
+        print(f"   2. 增加训练集中的困难样本比例")
+        print(f"   3. 使用质量感知训练（--photometric clahe）")
+    
+    print(f"\n" + "="*60 + "\n")
+    
+    # 显示图像（可选）
+    try:
+        plt.show()
+    except:
+        print("注意: 无法显示图形窗口（可能是无GUI环境），但图像已保存。")
+
+if __name__ == "__main__":
+    main()
+
+
+```
+
+## File: vis\__init__.py
+
+- Extension: .py
+- Language: python
+- Size: 139 bytes
+- Created: 2025-10-02 16:23:02
+- Modified: 2025-10-02 16:26:04
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+"""
+Visual uncertainty estimation module.
+Independent from IMU uncertainty code.
+"""
+__version__ = "0.1.0"
+
+
+```
+
+## File: vis\calibration\affine.py
+
+- Extension: .py
+- Language: python
+- Size: 1520 bytes
+- Created: 2025-10-14 00:28:08
+- Modified: 2025-10-14 00:28:08
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+# vis/calibration/affine.py
+import json
+import numpy as np
+
+class AffineCalibrator:
+    """标定 logvar：lg ≈ α * lp + β。只在 val 拟合，test 仅应用。"""
+    def __init__(self, name):
+        self.name = name
+        self.alpha = 1.0
+        self.beta = 0.0
+
+    def fit(self, lp: np.ndarray, lg: np.ndarray):
+        """
+        在验证集上拟合仿射变换参数
+        
+        Args:
+            lp: 预测的 logvar
+            lg: 真实的 logvar (GT)
+        """
+        # 允许鲁棒：对极端点做分位裁剪，避免被尾部拉偏
+        p_low, p_high = np.percentile(lp, [1.0, 99.0])
+        m = (lp >= p_low) & (lp <= p_high)
+        A = np.c_[lp[m], np.ones_like(lp[m])]
+        # 最小二乘：解 [α, β]
+        theta, *_ = np.linalg.lstsq(A, lg[m], rcond=None)
+        self.alpha, self.beta = float(theta[0]), float(theta[1])
+
+    def apply(self, lp: np.ndarray) -> np.ndarray:
+        """
+        应用校准变换
+        
+        Args:
+            lp: 预测的 logvar
+            
+        Returns:
+            校准后的 logvar
+        """
+        return self.alpha * lp + self.beta
+
+    def to_dict(self):
+        """序列化为字典"""
+        return {"type":"affine", "name":self.name,
+                "alpha":self.alpha, "beta":self.beta}
+
+    @staticmethod
+    def from_dict(d):
+        """从字典反序列化"""
+        c = AffineCalibrator(d["name"])
+        c.alpha, c.beta = float(d["alpha"]), float(d["beta"])
+        return c
+
+```
+
+## File: vis\calibration\__init__.py
+
+- Extension: .py
+- Language: python
+- Size: 150 bytes
+- Created: 2025-10-14 00:27:59
+- Modified: 2025-10-14 00:51:49
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+"""
+校准模块：用于 OOF 后处理标定 logvar
+"""
+from .affine import AffineCalibrator
+
+__all__ = ["AffineCalibrator"]
+
+```
+
+## File: vis\datasets\macro_frames.py
+
+- Extension: .py
+- Language: python
+- Size: 5132 bytes
+- Created: 2025-10-09 23:51:38
+- Modified: 2025-10-14 00:44:27
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+# vis/datasets/macro_frames.py
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+import os
+
+class MacroFrames(Dataset):
+    """
+    NPZ 字段约定：
+      patches:(M,K,2,H,W) uint8  [0..255]
+      geoms:  (M,K,G)     float32  # G维几何特征（默认模式20维，关键帧模式24维，自动从meta读取）
+      y_true: (M,2)       float32  # [logσx², logσy²]
+      num_tokens:(M,)     int32    # 每个样本真实点数（<=K）
+      y_inlier:(M,1)      uint8    # 内点标签 [0 或 1] (存储用uint8，使用时转float32)
+      meta:   dict                 # 包含 geom_dim, generation_mode, geoms_desc 等元信息
+    """
+    def __init__(self, npz_path: str, geom_stats_path: str = None, subset_idx: np.ndarray = None):
+        """
+        Args:
+            npz_path: NPZ 文件路径
+            geom_stats_path: 几何特征统计量文件路径（用于归一化）
+            subset_idx: 可选的子集索引数组，用于 K-fold OOF 训练（避免数据泄露）
+        """
+        z = np.load(npz_path, allow_pickle=True)
+        
+        # 先加载全部数据
+        patches_full = z["patches"]
+        geoms_full   = z["geoms"]
+        y_true_full  = z["y_true"]
+        num_tok_full = z["num_tokens"].astype(np.int64)
+        
+        # 如果指定了子集索引，只保留对应样本
+        if subset_idx is not None:
+            self.patches = patches_full[subset_idx]
+            self.geoms   = geoms_full[subset_idx]
+            self.y_true  = y_true_full[subset_idx]
+            self.num_tok = num_tok_full[subset_idx]
+            print(f"[Dataset] 使用子集索引: {len(subset_idx)}/{len(patches_full)} 样本")
+        else:
+            self.patches = patches_full
+            self.geoms   = geoms_full
+            self.y_true  = y_true_full
+            self.num_tok = num_tok_full
+        
+        # === 读取并显示元信息 ===
+        if "meta" in z:
+            meta = z["meta"].item() if hasattr(z["meta"], 'item') else z["meta"]
+            self.meta = meta
+            print(f"[Dataset] 加载数据: {os.path.basename(npz_path)}")
+            print(f"  生成模式: {meta.get('generation_mode', 'unknown')}")
+            print(f"  几何特征维度: {meta.get('geom_dim', self.geoms.shape[2])}")
+            print(f"  样本数: {self.patches.shape[0]}")
+            if 'kf_policy' in meta and meta['kf_policy'] is not None:
+                print(f"  关键帧策略: parallax={meta['kf_policy'].get('parallax_px')}px, "
+                      f"max_dt={meta['kf_policy'].get('max_interval_s')}s")
+        else:
+            self.meta = {}
+            print(f"[Dataset] 警告: NPZ文件缺少meta信息，使用默认配置")
+        
+        # === 加载内点标签（uint8存储，节省空间）===
+        # 如果旧的npz文件没有这个键，就默认所有都是内点
+        if "y_inlier" in z:
+            y_inlier_full = z["y_inlier"]  # uint8 或 float32
+            if subset_idx is not None:
+                self.y_inlier = y_inlier_full[subset_idx]
+            else:
+                self.y_inlier = y_inlier_full
+        else:
+            # 旧NPZ兜底：全部标记为内点
+            self.y_inlier = np.ones((len(self.y_true), 1), dtype=np.uint8)
+            print(f"[Dataset] 警告: 旧格式NPZ，自动创建内点标签（全部标记为内点）")
+
+        # === 新增：加载并准备归一化统计量 ===
+        if geom_stats_path and os.path.exists(geom_stats_path):
+            stats = np.load(geom_stats_path)
+            self.geom_mean = torch.from_numpy(stats['mean'].astype(np.float32))
+            self.geom_std = torch.from_numpy(stats['std'].astype(np.float32))
+            print(f"[Dataset] 已加载特征统计量: {geom_stats_path}")
+            print(f"  Mean shape: {self.geom_mean.shape}, Std shape: {self.geom_std.shape}")
+        else:
+            if geom_stats_path:
+                print(f"[Dataset] 警告: 未找到统计量文件 {geom_stats_path}")
+            print("[Dataset] 警告: 未提供特征统计量，geoms将不进行归一化")
+            self.geom_mean = None
+            self.geom_std = None
+
+    def __len__(self): return self.patches.shape[0]
+
+    def __getitem__(self, i: int):
+        # 转换geoms为tensor
+        geoms_tensor = torch.from_numpy(self.geoms[i])
+
+        # === 新增：应用Z-score归一化 ===
+        if self.geom_mean is not None and self.geom_std is not None:
+            geoms_tensor = (geoms_tensor - self.geom_mean) / self.geom_std
+
+        return {
+            "patches": torch.from_numpy(self.patches[i].astype(np.float32) / 255.0),
+            "geoms":   geoms_tensor,  # 已归一化（如果有统计量）
+            "y_true":  torch.from_numpy(self.y_true[i]),
+            "num_tok": torch.tensor(self.num_tok[i], dtype=torch.long),
+            # === 返回内点标签（转为float32用于BCE loss）===
+            "y_inlier": torch.from_numpy(self.y_inlier[i].astype(np.float32)),
+        }
+
+
+```
+
+## File: vis\datasets\__init__.py
+
+- Extension: .py
+- Language: python
+- Size: 195 bytes
+- Created: 2025-10-02 16:23:04
+- Modified: 2025-10-10 00:01:36
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+# 旧的微观模式数据集已移除
+# 宏观模式使用 vis.datasets.macro_frames.MacroFrames
+
+from .macro_frames import MacroFrames
+
+__all__ = ["MacroFrames"]
+
+```
+
+## File: vis\losses\__init__.py
+
+- Extension: .py
+- Language: python
+- Size: 208 bytes
+- Created: 2025-10-02 16:23:07
+- Modified: 2025-10-10 00:01:36
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+# 旧的微观模式损失函数已移除
+# 宏观模式使用 models.macro_transformer_sa 中的 StudentTLoss
+# 或直接使用 torch.nn.functional.smooth_l1_loss
+
+__all__ = []
+
+```
+
+## File: vis\models\__init__.py
+
+- Extension: .py
+- Language: python
+- Size: 147 bytes
+- Created: 2025-10-02 16:23:06
+- Modified: 2025-10-10 00:01:36
+
+### Code
+
+```python
+# -*- coding: utf-8 -*-
+# 旧的微观模式模型已移除
+# 宏观模式使用 models.macro_transformer_sa.MacroTransformerSA
+
+__all__ = []
+
+```
+

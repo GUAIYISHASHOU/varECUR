@@ -1,0 +1,58 @@
+# Training outputs
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# Data files
+*.npz
+*.csv
+data/
+F:/SLAMdata/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+imu.txt
+
+# OOF training artifacts
+
+scaler_fold*.json
+curve_fold*.json
+oof_summary.json
+__pycache__/
+*.pyc
+.pytest_cache/
+wandb/
+lightning_logs/
+runs/

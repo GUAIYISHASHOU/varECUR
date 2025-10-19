@@ -1,0 +1,87 @@
+# OOF训练配置文件
+# 用于Out-of-Fold交叉验证训练
+
+common:
+  seed: 2025  # 改变种子以验证修改是否生效（之前是2024）
+  device: "cuda"
+  num_workers: 0  # Windows建议设为0
+  log_dir: "runs"
+
+train:
+  # 数据路径（用于传统train.py训练）
+  train_npz: "F:/SLAMdata/_cache/imu_euroc_merged/train_all.npz"
+  val_npz:   "F:/SLAMdata/_cache/imu_euroc_merged/val_all.npz"
+  
+  # 训练参数
+  batch_size: 16
+  epochs: 200
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  early_stop_patience: 15
+  
+  # 学习率调度器
+  scheduler: "warmup_cosine"  # "warmup_cosine" | "plateau"
+  warmup_epochs: 4
+  
+  # 损失函数
+  dist: "studentt"
+  use_studentt: true  # Student-t对角NLL（推荐）
+  nu: 9  # 略更重尾，帮助区分误差大小，利于排序
+  logv_min: -6.0
+  logv_max: 1.0
+  logv_max_warmup: 2.0
+  logv_max_warmup_frac: 0.35
+  use_bounded: true  # 使用tanh有界参数化（强烈推荐）
+  lambda_center: 0.05
+  
+  # 训练约束（增强中心化，温和各向异性与TV）
+  lambda_center_axes: 0.10       # 温和居中
+  lambda_center_axes_warmup_frac: 0.10
+  lambda_cov68: 0.80
+  cov68_target: 0.68
+  cov68_tau: 0.05
+  lambda_cov68_axes: 0.20
+  cov68_tau_axes: 0.05
+  lambda_aniso_l2: 0.004         # 温和抑制各向异性膨胀
+  lambda_tv: 0.0001              # 温和的时间平滑
+  lambda_z2_low: 0.05
+  z2_low_margin: 0.10
+  use_ema_z2_stats: true
+  ema_z2_decay: 0.98
+  lambda_z2_var: 0.0
+  lambda_s_scale: 0.0
+  variance_warmup_epochs: 8
+  variance_aniso_warmup_epochs: 30
+
+  # 方差头学习率降低（更稳）
+  var_head_lr_mult: 0.5
+  var_head_lr_mult_s: 1.1
+  var_head_lr_mult_a: 0.08
+  
+  # 方差参数化
+  variance_param: "sa3"  # "direct" | "sa3"
+  aniso:
+    use_tanh: true
+    kappa_xy: 1.3  # 放宽形状自由度，避免用“整体放大σ²”兜不确定性
+    kappa_z: 1.3
+
+model:
+  d_model: 128
+  n_tcn: 4
+  kernel_size: 3
+  n_layers_tf: 0  # Transformer层数（0=纯TCN）
+  n_heads: 4
+  dropout: 0.1
+
+# OOF特定配置
+oof:
+  # 数据路径
+  seq_npz_dir: "F:/SLAMdata/_cache/imu_euroc_MH4"  # 仅包含4条用于OOF的序列
+  splits_json: "F:/SLAMdata/_cache/imu_euroc_MH4/splits_oof.json"  # 分折文件
+  
+  # 分折参数（用于生成splits）
+  n_folds: 4
+  fold_seed: 42
+  
+  # Manifest文件（用于生成splits）
+  manifest_json: "F:/SLAMdata/_cache/imu_euroc_MH4/manifest.json"  # 包含每个序列的窗口数等信息
