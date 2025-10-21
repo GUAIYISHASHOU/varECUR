@@ -1,0 +1,10 @@
+{
+  "route": "acc",
+  "folds": [
+    {"train": ["MH_02_easy", "MH_04_difficult", "MH_05_difficult"], "val": ["MH_01_easy"]},
+    {"train": ["MH_01_easy", "MH_04_difficult", "MH_05_difficult"], "val": ["MH_02_easy"]},
+    {"train": ["MH_01_easy", "MH_02_easy", "MH_05_difficult"], "val": ["MH_04_difficult"]},
+    {"train": ["MH_01_easy", "MH_02_easy", "MH_04_difficult"], "val": ["MH_05_difficult"]}
+  ],
+  "test": ["MH_03_medium"]
+}

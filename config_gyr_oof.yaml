@@ -1,0 +1,60 @@
+# 陀螺仪专用OOF训练配置 (基于analyze_gyr_range.py的分析结果)
+# logv范围已针对陀螺仪的小误差尺度调优
+
+train:
+  batch_size: 64
+  epochs: 200
+  lr: 0.001
+  var_head_lr_mult_s: 5.0
+  var_head_lr_mult_a: 3.0
+  weight_decay: 0.00001
+  
+  # 损失函数
+  dist: "studentt"
+  use_studentt: true
+  nu: 30
+  
+  # Log-variance 范围（陀螺仪专用！）
+  logv_min: -11.18  # 陀螺仪误差较小：实际P10约-9.5
+  logv_max: -0.64   # 陀螺仪误差范围：实际P90约-1.4
+  logv_max_warmup: -2.0  # Warmup期更保守
+  logv_max_warmup_frac: 0.35
+  use_bounded: true
+  
+  # 正则化权重
+  lambda_center_axes: 0.05
+  lambda_aniso_l2: 0.01
+  lambda_tv: 0.0
+  lambda_cov68: 0.35
+  cov68_target: 0.68
+  lambda_s_scale: 0.0
+  
+  # 方差参数化
+  variance_param: "sa3"
+  aniso:
+    use_tanh: true
+    kappa_xy: 1.5  # X-Y各向异性幅度限制（陀螺仪略放宽）
+    kappa_z: 2.0   # Z轴各向异性幅度限制（Z轴误差明显大于X/Y）
+  
+  # 方差头warmup策略
+  variance_warmup_epochs: 10
+  variance_aniso_warmup_epochs: 12
+  
+  # 学习率调度
+  scheduler: "warmup_cosine"
+  warmup_epochs: 5
+  
+  # Early stopping
+  early_stop_patience: 20
+  
+model:
+  d_model: 128
+  n_tcn: 4
+  tcn_kernel: 7
+  tcn_dilation_base: 2
+  dropout: 0.1
+  use_transformer: false
+  
+data:
+  T: 512
+  stride: 256
